@@ -18,6 +18,9 @@ from prismatic.models.backbones.llm.prompting import (
     PurePromptBuilder,
     VicunaV15ChatPromptBuilder,
 )
+from prismatic.overwatch import initialize_overwatch
+
+overwatch = initialize_overwatch(__name__)
 
 # Registry =>> Support LLaMa-2 Models (from HF Transformers)
 # fmt: off
@@ -47,6 +50,17 @@ LLAMA2_MODELS = {
 
     "vicuna-v15-13b": {
         "llm_family": "llama2", "llm_cls": LlamaForCausalLM, "hf_hub_path": "lmsys/vicuna-13b-v1.5"
+    },
+
+    # === SmolLM2 (HuggingFaceTB) — Llama-architecture, sub-1B sizes for smoke tests ===
+    # NOTE: These models use a GPT-2-style BPE tokenizer (no auto-BOS); they require
+    # an entry in `SPECIAL_CASES` (see base_llm.py) to bypass the BOS-prefix assertion.
+    "smollm2-135m-instruct": {
+        "llm_family": "smollm2", "llm_cls": LlamaForCausalLM, "hf_hub_path": "HuggingFaceTB/SmolLM2-135M-Instruct"
+    },
+
+    "smollm2-360m-instruct": {
+        "llm_family": "smollm2", "llm_cls": LlamaForCausalLM, "hf_hub_path": "HuggingFaceTB/SmolLM2-360M-Instruct"
     },
 }
 # fmt: on
@@ -85,6 +99,19 @@ class LLaMa2LLMBackbone(HFCausalLLMBackbone):
 
         elif self.identifier.startswith("vicuna"):
             return VicunaV15ChatPromptBuilder
+
+        elif self.identifier.startswith("smollm2"):
+            # SmolLM2-Instruct was chat-tuned with an `<|im_start|>` template; PurePromptBuilder's
+            # `In:/Out:` format does NOT match that. The model will still train and produce a loss
+            # curve (fine for wiring/smoke tests), but expect noticeably worse convergence and final
+            # accuracy than a proper chat-template prompter. Replace with a dedicated
+            # SmolLM2ChatPromptBuilder before reporting any numbers.
+            overwatch.warning(
+                f"[smollm2] Using PurePromptBuilder for `{self.identifier}` — this does NOT match "
+                "SmolLM2-Instruct's chat template (`<|im_start|>` style). Expect degraded loss/accuracy "
+                "vs. a proper chat-template prompter. OK for smoke tests; replace before reporting results."
+            )
+            return PurePromptBuilder
 
         raise ValueError(f"No PromptBuilder defined for LLM Backbone `{self.identifier}`")
 

@@ -70,6 +70,10 @@ LLM_BACKBONES = {
 
     # === Phi-2 Backbone ===
     "phi-2-3b": {"cls": PhiLLMBackbone, "kwargs": {}},
+
+    # === SmolLM2 (Llama-architecture; routed through LLaMa2LLMBackbone) ===
+    "smollm2-135m-instruct": {"cls": LLaMa2LLMBackbone, "kwargs": {}},
+    "smollm2-360m-instruct": {"cls": LLaMa2LLMBackbone, "kwargs": {}},
 }
 
 # fmt: on

@@ -169,6 +169,10 @@ class HFCausalLLMBackbone(LLMBackbone, ABC):
             #       this works well with base LLM generation.
             #   =>> Like Llama-2 Tokenizers -- we'll add a special PAD token for training purposes.
             "phi-2-3b",
+            # SmolLM2 (HuggingFaceTB) uses a GPT-2-style BPE tokenizer that does NOT auto-prefix BOS;
+            # same treatment as Phi-2 — manual BOS placement happens in PrismaticVLM.forward's image splice.
+            "smollm2-135m-instruct",
+            "smollm2-360m-instruct",
         }
         if self.identifier in SPECIAL_CASES:
             return

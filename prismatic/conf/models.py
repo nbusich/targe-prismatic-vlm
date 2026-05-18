@@ -501,6 +501,32 @@ class Exp_7B_Targe_DINOSigLIP_224px(Prism_7B_DINOSigLIP_224px):
     selector_inference_k: int = 128
 
 
+# === TARGE :: SmolLM2 Smoke-Test Variants (sub-1B LLMs paired with small vision encoders) ===
+# These exist so the selector wiring can be exercised on free-tier Colab (T4 16GB).
+# Performance is intentionally not the goal — these are for proving the forward/backward path
+# works end-to-end before promoting to a 7B run on Pro-tier hardware.
+@dataclass
+class Exp_Targe_SmolLM2_360M_CLIPb_224px(Ext_Exp_3B_Phi_2):
+    model_id: str = "targe-smollm2-360m-clipb-224px"
+    llm_backbone_id: str = "smollm2-360m-instruct"
+    vision_backbone_id: str = "clip-vit-b"
+    image_resize_strategy: str = "resize-naive"
+    arch_specifier: str = "no-align+selector"
+    llm_max_length: int = 1024
+    selector_num_compressed_tokens: int = 32
+    selector_inference_k: int = 64
+
+    # Tighter defaults so it fits comfortably on T4 with room to grow batch size.
+    align_per_device_batch_size: int = 4
+    align_global_batch_size: int = 4
+
+
+@dataclass
+class Exp_Targe_SmolLM2_135M_CLIPb_224px(Exp_Targe_SmolLM2_360M_CLIPb_224px):
+    model_id: str = "targe-smollm2-135m-clipb-224px"
+    llm_backbone_id: str = "smollm2-135m-instruct"
+
+
 # === Define a Model Registry Enum for Reference & Validation ===
 @unique
 class ModelRegistry(Enum):
@@ -580,6 +606,8 @@ class ModelRegistry(Enum):
 
     # === TARGE ===
     EXP_TARGE_DINOSIGLIP_224PX_7B = Exp_7B_Targe_DINOSigLIP_224px
+    EXP_TARGE_SMOLLM2_360M = Exp_Targe_SmolLM2_360M_CLIPb_224px
+    EXP_TARGE_SMOLLM2_135M = Exp_Targe_SmolLM2_135M_CLIPb_224px
 
     @property
     def model_id(self) -> str:
