@@ -72,8 +72,10 @@ LLM_BACKBONES = {
     "phi-2-3b": {"cls": PhiLLMBackbone, "kwargs": {}},
 
     # === SmolLM2 (Llama-architecture; routed through LLaMa2LLMBackbone) ===
-    "smollm2-135m-instruct": {"cls": LLaMa2LLMBackbone, "kwargs": {}},
-    "smollm2-360m-instruct": {"cls": LLaMa2LLMBackbone, "kwargs": {}},
+    # flash-attn-2 disabled: required for free-tier Colab T4 (Turing, sm_75) which doesn't
+    # support flash-attn-2 (needs Ampere sm_80+). HF falls back to PyTorch SDPA.
+    "smollm2-135m-instruct": {"cls": LLaMa2LLMBackbone, "kwargs": {"use_flash_attention_2": False}},
+    "smollm2-360m-instruct": {"cls": LLaMa2LLMBackbone, "kwargs": {"use_flash_attention_2": False}},
 }
 
 # fmt: on
