@@ -520,10 +520,17 @@ class Exp_Targe_SmolLM2_360M_CLIPb_224px(Ext_Exp_3B_Phi_2):
     align_per_device_batch_size: int = 4
     align_global_batch_size: int = 4
 
-    # Disable gradient checkpointing: with a 360M frozen LLM there's no memory pressure on
-    # T4, and FSDP's NO_SHARD fallback (single-GPU) + checkpointing + mostly-frozen params
-    # trips an `as_params=True type(prim_param)=Tensor` assertion in _flat_param.py during
-    # post-forward reshard. Disabling checkpointing sidesteps that code path entirely.
+    # SmolLM2 ships with tie_word_embeddings=True. On a single GPU FSDP falls back to
+    # NO_SHARD; with use_orig_params=True the tied embed_tokens/lm_head pair lives in
+    # _shared_param_infos and post-forward reshard trips an
+    # `as_params=True type(prim_param)=Tensor` assert. DDP fits the 135M/360M model
+    # easily on T4 and bypasses that code path entirely.
+    align_train_strategy: str = "ddp"
+    finetune_train_strategy: str = "ddp"
+
+    # DDPStrategy asserts weight_decay == 0 (no param-group split implemented there).
+    finetune_weight_decay: float = 0.0
+
     enable_gradient_checkpointing: bool = False
 
 
