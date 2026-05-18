@@ -520,6 +520,12 @@ class Exp_Targe_SmolLM2_360M_CLIPb_224px(Ext_Exp_3B_Phi_2):
     align_per_device_batch_size: int = 4
     align_global_batch_size: int = 4
 
+    # Disable gradient checkpointing: with a 360M frozen LLM there's no memory pressure on
+    # T4, and FSDP's NO_SHARD fallback (single-GPU) + checkpointing + mostly-frozen params
+    # trips an `as_params=True type(prim_param)=Tensor` assertion in _flat_param.py during
+    # post-forward reshard. Disabling checkpointing sidesteps that code path entirely.
+    enable_gradient_checkpointing: bool = False
+
 
 @dataclass
 class Exp_Targe_SmolLM2_135M_CLIPb_224px(Exp_Targe_SmolLM2_360M_CLIPb_224px):
