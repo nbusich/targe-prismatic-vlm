@@ -55,8 +55,9 @@ DATASET_SUBDIR = "llava-laion-cc-sbu-558k"
 class SmokeDatasetConfig:
     # fmt: off
     num_samples: int = 2000                         # How many samples to keep. Suggested: 100 (pure wiring smoke), 2000 (sane loss trend), 10000 (slow but real-ish).
+    train_pct: float = 1.0                          # Fraction of `num_samples` that goes to train; remainder goes to test. 1.0 = no test split.
     root_dir: Path = Path("data")                   # Mirrors scripts/preprocess.py — files land at {root_dir}/download/{DATASET_SUBDIR}/
-    seed: Optional[int] = 7                         # Seed for random subsampling. None = take the first N (deterministic but biased).
+    seed: Optional[int] = 7                         # Seed for random subsampling + train/test split. None = take the first N (deterministic but biased), no shuffle for split.
     keep_full_json: bool = False                    # If True, also stash the un-subsampled JSON next to chat.json as chat.json.full (for resampling later without re-downloading)
     # fmt: on
 
@@ -130,11 +131,25 @@ def _extract_images(needed: set[str], dest_root: Path) -> None:
     overwatch.info(f"[smoke] done: extracted {len(to_fetch) - len(failures)} new images")
 
 
+def _split_train_test(entries: list, train_pct: float, seed: Optional[int]) -> tuple[list, list]:
+    """Shuffle (if `seed` is set) and split into train/test. `train_pct` is in [0.0, 1.0]."""
+    if not 0.0 <= train_pct <= 1.0:
+        raise ValueError(f"train_pct must be in [0.0, 1.0], got {train_pct}")
+    if seed is None:
+        # Deterministic but biased — preserves source order.
+        ordered = list(entries)
+    else:
+        ordered = list(entries)
+        random.Random(seed + 1).shuffle(ordered)
+    n_train = int(round(train_pct * len(ordered)))
+    return ordered[:n_train], ordered[n_train:]
+
+
 @draccus.wrap()
 def make_smoke_dataset(cfg: SmokeDatasetConfig) -> None:
     overwatch.info(
         f"[smoke] building a {cfg.num_samples}-sample subset of {DATASET_SUBDIR} "
-        f"under {cfg.root_dir}/download/{DATASET_SUBDIR}/"
+        f"(train_pct={cfg.train_pct}) under {cfg.root_dir}/download/{DATASET_SUBDIR}/"
     )
 
     dataset_root = cfg.root_dir / "download" / DATASET_SUBDIR
@@ -142,6 +157,7 @@ def make_smoke_dataset(cfg: SmokeDatasetConfig) -> None:
 
     chat_full_path = dataset_root / "chat.json.full"
     chat_path = dataset_root / "chat.json"
+    chat_test_path = dataset_root / "chat_test.json"
 
     _download_json(chat_full_path)
     with chat_full_path.open() as f:
@@ -149,11 +165,22 @@ def make_smoke_dataset(cfg: SmokeDatasetConfig) -> None:
     overwatch.info(f"[smoke] full JSON has {len(full_entries)} entries")
 
     subset = _subsample(full_entries, cfg.num_samples, cfg.seed)
-    with chat_path.open("w") as f:
-        json.dump(subset, f)
-    overwatch.info(f"[smoke] wrote {chat_path} with {len(subset)} entries")
+    train_entries, test_entries = _split_train_test(subset, cfg.train_pct, cfg.seed)
 
-    needed = {entry["image"] for entry in subset}
+    with chat_path.open("w") as f:
+        json.dump(train_entries, f)
+    overwatch.info(f"[smoke] wrote {chat_path} with {len(train_entries)} train entries")
+
+    if test_entries:
+        with chat_test_path.open("w") as f:
+            json.dump(test_entries, f)
+        overwatch.info(f"[smoke] wrote {chat_test_path} with {len(test_entries)} test entries")
+    else:
+        # Drop a stale test JSON from a previous run with a smaller train_pct, so we don't lie about the split.
+        chat_test_path.unlink(missing_ok=True)
+        overwatch.info(f"[smoke] train_pct={cfg.train_pct} → no test split written")
+
+    needed = {entry["image"] for entry in train_entries} | {entry["image"] for entry in test_entries}
     _ensure_remotezip()
     _extract_images(needed, dataset_root)
 
@@ -162,8 +189,9 @@ def make_smoke_dataset(cfg: SmokeDatasetConfig) -> None:
         overwatch.info(f"[smoke] removed {chat_full_path} (set keep_full_json=true to retain)")
 
     overwatch.info(
-        f"[smoke] ready. Launch training with `--dataset.type llava-v15 "
-        f"--dataset.dataset_root_dir {cfg.root_dir}`"
+        f"[smoke] ready. Train manifest: {chat_path} ({len(train_entries)} entries); "
+        f"test manifest: {chat_test_path if test_entries else '<none>'} ({len(test_entries)} entries). "
+        f"Launch training with `--dataset.type llava-v15 --dataset.dataset_root_dir {cfg.root_dir}`"
     )
 
 

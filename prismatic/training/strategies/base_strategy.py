@@ -239,6 +239,28 @@ class TrainingStrategy(ABC):
                                 keep_gap = keep_probs.mean() - self.selector_target_keep_ratio
                                 loss = loss + self.selector_lambda_target * ramp * keep_gap.pow(2)
 
+                    # --- NaN/Inf guard: diagnose blow-ups before they corrupt optimizer state ---
+                    if not torch.isfinite(loss):
+                        ce_loss = output.loss
+                        diag = {
+                            "step": metrics.global_step,
+                            "tau": getattr(projector_inner, "tau", None),
+                            "ce_loss": ce_loss.item() if torch.isfinite(ce_loss) else float(ce_loss),
+                            "total_loss": float(loss),
+                        }
+                        if keep_probs is not None:
+                            diag["keep_probs_mean"] = keep_probs.float().mean().item()
+                            diag["keep_probs_min"] = keep_probs.float().min().item()
+                            diag["keep_probs_max"] = keep_probs.float().max().item()
+                            diag["keep_probs_has_nan"] = bool(torch.isnan(keep_probs).any().item())
+                        for name, p in projector_inner.named_parameters():
+                            if not torch.isfinite(p).all():
+                                diag[f"param_{name}_nonfinite"] = True
+                        overwatch.error(f"[NaN GUARD] non-finite loss detected: {diag}")
+                        # Skip backward/step so we don't poison the optimizer; log and continue to next batch.
+                        self.optimizer.zero_grad(set_to_none=True)
+                        continue
+
                     # Commit Loss (Prior to Gradient Accumulation Normalization)
                     metrics.commit(loss=loss)
 
