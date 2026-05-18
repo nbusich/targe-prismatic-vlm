@@ -7,6 +7,13 @@ Notes:
     - For now, we don't subclass `transformers.PretrainedModel` (or CausalLM). Instead, we assume a very limited subset
       of the {Model}ForCausalLM API that enables dispatch to the underlying LLM's `generate` utilities (feeding inputs
       through our custom projection shim).
+
+
+CHANGES:
+    - Imported selector compressor pipeline
+    - __init__: added if statement to include selector compressor
+    - get_fsdp_wrapping_policy: added SelectorCompressorPipeline class
+    - Usage of self.projector to account for training and new selector
 """
 
 from __future__ import annotations
@@ -26,6 +33,7 @@ from prismatic.models.backbones.vision import VisionBackbone
 from prismatic.models.vlms.base_vlm import VLM
 from prismatic.overwatch import initialize_overwatch
 from prismatic.util.nn_utils import FusedMLPProjector, LinearProjector, MLPProjector
+from prismatic.util.selector import SelectorCompressorPipeline
 
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
@@ -43,6 +51,7 @@ class PrismaticVLM(VLM):
         llm_backbone: LLMBackbone,
         enable_mixed_precision_training: bool = True,
         arch_specifier: str = "gelu-mlp",
+        selector_kwargs: Optional[dict] = None
     ) -> None:
         super().__init__(
             "prismatic",
@@ -63,6 +72,15 @@ class PrismaticVLM(VLM):
             self.projector = FusedMLPProjector(vision_backbone.embed_dim, llm_backbone.embed_dim)
         elif arch_specifier.endswith("gelu-mlp"):
             self.projector = MLPProjector(vision_backbone.embed_dim, llm_backbone.embed_dim)
+        elif arch_specifier.endswith("selector"):
+            sk = selector_kwargs or {}
+            self.projector = SelectorCompressorPipeline(
+                vision_dim=vision_backbone.embed_dim,
+                llm_dim=llm_backbone.embed_dim,
+                num_heads=sk.get("num_heads", 12),
+                num_compressed_tokens=sk.get("num_compressed_tokens", 32),
+            )
+            self.projector.inference_k = sk.get("inference_k", 128)
         else:
             raise ValueError(f"PrismaticVLM with `{arch_specifier = }` is not supported!")
 
@@ -90,6 +108,7 @@ class PrismaticVLM(VLM):
         llm_backbone: LLMBackbone,
         enable_mixed_precision_training: bool = True,
         arch_specifier: str = "gelu-mlp",
+        selector_kwargs: Optional[dict] = None
     ) -> PrismaticVLM:
         """Initialize a PrismaticVLM from a pretrained checkpoint, freezing all weights, tailored for inference."""
         vlm = cls(
@@ -98,6 +117,7 @@ class PrismaticVLM(VLM):
             llm_backbone,
             enable_mixed_precision_training=enable_mixed_precision_training,
             arch_specifier=arch_specifier,
+            selector_kwargs=selector_kwargs
         )
 
         # Load from Checkpoint (Custom --> should load both *projector* and *llm* weights)
@@ -229,9 +249,10 @@ class PrismaticVLM(VLM):
         llm_fsdp_wrapping_policy = self.llm_backbone.get_fsdp_wrapping_policy()
 
         # Get Prismatic Wrapping Policy =>> just a module wrapping policy around `self.projector`
+        # NOTE: changed to add selectorcompressor
         prismatic_fsdp_wrapping_policy = partial(
             _module_wrap_policy,
-            module_classes={LinearProjector, MLPProjector, FusedMLPProjector},
+            module_classes={LinearProjector, MLPProjector, FusedMLPProjector, SelectorCompressorPipeline},
         )
 
         # Return union (_or_) over constituent policies
@@ -313,15 +334,34 @@ class PrismaticVLM(VLM):
                 patch_features = self.vision_backbone(pixel_values[multimodal_indices])
 
         # Projection Logic :: [bsz, num_patches, llm_embed_dim] =>> num_patches = (2 *) (256 + 1) for ViT-L + CLS
-        projected_patch_embeddings = self.projector(patch_features)
-        projected_patch_attention_mask = None
-        if attention_mask is not None:
-            projected_patch_attention_mask = torch.full(
-                (projected_patch_embeddings.shape[0], projected_patch_embeddings.shape[1]),
-                True,
-                dtype=attention_mask.dtype,
-                device=attention_mask.device,
-            )
+        
+        # ------------------------------ NOTE: SELECTOR START ------------------------------ #
+        if self.arch_specifier.endswith("selector"):
+            if self.training:
+                projected_patch_embeddings, patch_valid_mask = self.projector(patch_features)
+            else:
+                # Inference physically drops tokens, so all returned tokens are valid
+                projected_patch_embeddings = self.projector(patch_features)
+                patch_valid_mask = torch.ones(
+                    (projected_patch_embeddings.shape[0], projected_patch_embeddings.shape[1]), 
+                    dtype=torch.bool, device=patch_features.device
+                )
+
+            projected_patch_attention_mask = None
+            if attention_mask is not None:
+                # Use your custom mask instead of forcing True!
+                projected_patch_attention_mask = patch_valid_mask
+        else:
+            projected_patch_embeddings = self.projector(patch_features)
+            projected_patch_attention_mask = None
+            if attention_mask is not None:
+                projected_patch_attention_mask = torch.full(
+                    (projected_patch_embeddings.shape[0], projected_patch_embeddings.shape[1]),
+                    True,
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+        # ------------------------------ NOTE: SELECTOR END --------------------------------- #
 
         # Get Input Embeddings from LLM Backbone :: [bsz, input_seq_len, llm_embed_dim]
         input_embeddings = self.llm_backbone.embed_input_ids(input_ids)

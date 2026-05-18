@@ -59,6 +59,10 @@ class FSDPStrategy(TrainingStrategy):
         worker_init_fn: Optional[Callable[[int], None]] = None,
         sharding_strategy: str = "shard-grad-op",
         state_dict_type: StateDictType = StateDictType.FULL_STATE_DICT,
+        selector_tau_start: float = 1.0,
+        selector_tau_end: float = 0.1,
+        selector_lambda_target: float = 0.05,
+        selector_lambda_warmup_ratio: float = 0.1,
     ) -> None:
         super().__init__(
             vlm=vlm,
@@ -77,6 +81,10 @@ class FSDPStrategy(TrainingStrategy):
             reduce_in_full_precision=reduce_in_full_precision,
             mixed_precision_dtype=mixed_precision_dtype,
             worker_init_fn=worker_init_fn,
+            selector_tau_start=selector_tau_start,
+            selector_tau_end=selector_tau_end,
+            selector_lambda_target=selector_lambda_target,
+            selector_lambda_warmup_ratio=selector_lambda_warmup_ratio,
         )
 
         # FSDP-Specific Parameters

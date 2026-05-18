@@ -25,6 +25,8 @@ from prismatic.util import check_bloat16_supported
 from prismatic.util.batching_utils import SplitModalitySampler
 from prismatic.util.data_utils import PaddedCollatorForLanguageModeling
 
+# NOT BEST PRACTICE: using model dataclass to store training parameters
+
 # Initialize Overwatch =>> Wraps `logging.Logger`
 overwatch = initialize_overwatch(__name__)
 
@@ -48,6 +50,10 @@ class TrainingStrategy(ABC):
         enable_mixed_precision_training: bool = True,
         reduce_in_full_precision: bool = False,
         mixed_precision_dtype: torch.dtype = torch.bfloat16,
+        selector_tau_start: float = 1.0,
+        selector_tau_end: float = 0.1,
+        selector_lambda_target: float = 0.05,
+        selector_lambda_warmup_ratio: float = 0.1,
         worker_init_fn: Optional[Callable[[int], None]] = None,
         **_: str,
     ) -> None:
@@ -75,6 +81,12 @@ class TrainingStrategy(ABC):
 
         # Optimizers & Scheduler (initialized in `run_setup`)
         self.optimizer, self.lr_scheduler = None, None
+
+        # Selector schedule parameters
+        self.selector_tau_start = selector_tau_start
+        self.selector_tau_end = selector_tau_end
+        self.selector_lambda_target = selector_lambda_target
+        self.selector_lambda_warmup_ratio = selector_lambda_warmup_ratio
 
         # Lightweight Validation
         assert (
@@ -173,6 +185,21 @@ class TrainingStrategy(ABC):
                 # Note that we'll unpack batch (and let AMP/FSDP do its thing) in the VLM.forward() call
                 #   => Basically, if we're using mixed precision (or not), autocast()/FSDP will move to device!
                 for train_idx, batch in enumerate(dataloader):
+                    # Unwrap through DDP/FSDP wrappers so attribute writes hit the underlying selector
+                    # module — FSDP/DDP forward attribute reads via __getattr__ but DO NOT intercept
+                    # __setattr__, so `wrapped.tau = X` would set on the wrapper, not the inner module.
+                    vlm_inner = getattr(self.vlm, "module", self.vlm)
+                    projector = vlm_inner.projector
+                    projector_inner = getattr(projector, "module", projector)
+                    if hasattr(projector_inner, "tau") and getattr(projector_inner, "selector", None) is not None:
+                        total = self.max_steps if self.max_steps is not None else len(dataloader) * self.epochs
+                        progress = metrics.global_step / max(1, total)
+                        projector_inner.tau = max(
+                            self.selector_tau_end,
+                            self.selector_tau_start
+                            - (self.selector_tau_start - self.selector_tau_end) * progress,
+                        )
+
                     # [Contract] self.vlm.forward() must automatically compute `loss` and return!
                     with torch.autocast(
                         "cuda",
@@ -187,6 +214,15 @@ class TrainingStrategy(ABC):
                             multimodal_indices=batch["multimodal_indices"],
                         )
                         loss = output.loss
+
+                        # --- TARGE: L1 sparsity on keep_probs ---
+                        keep_probs = getattr(projector_inner, "latest_keep_probs", None)
+                        if keep_probs is not None:
+                            total = self.max_steps if self.max_steps is not None else len(dataloader) * self.epochs
+                            warmup = int(self.selector_lambda_warmup_ratio * total)
+                            if metrics.global_step >= warmup:
+                                ramp = min(1.0, (metrics.global_step - warmup) / max(1, total - warmup))
+                                loss = loss + self.selector_lambda_target * ramp * keep_probs.mean()
 
                     # Commit Loss (Prior to Gradient Accumulation Normalization)
                     metrics.commit(loss=loss)

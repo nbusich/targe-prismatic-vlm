@@ -70,6 +70,11 @@ class ModelConfig(ChoiceRegistry):
     enable_mixed_precision_training: bool = True            # Whether to enable mixed precision training
     reduce_in_full_precision: bool = False                  # Whether to run gradient reduction in FP32
 
+    # === Selector / Connector Hyperparameters (only used when arch_specifier endswith "selector") ===
+    selector_num_heads: int = 12
+    selector_num_compressed_tokens: int = 32
+    selector_inference_k: int = 128
+
     # fmt: on
 
 
@@ -488,6 +493,13 @@ class Prism_7B_DINOSigLIP_224px(Exp_7B_One_Stage):
     arch_specifier: str = "no-align+fused-gelu-mlp"
     finetune_epochs: int = 2
 
+@dataclass
+class Exp_7B_Targe_DINOSigLIP_224px(Prism_7B_DINOSigLIP_224px):
+    model_id: str = "targe-dinosiglip-224px+7b"
+    arch_specifier: str = "no-align+selector"
+    selector_num_compressed_tokens: int = 32
+    selector_inference_k: int = 128
+
 
 # === Define a Model Registry Enum for Reference & Validation ===
 @unique
@@ -565,6 +577,9 @@ class ModelRegistry(Enum):
     # === Inference Optimized :: 224px Prism Models ===
     PRISM_DINOSIGLIP_224PX_CONTROLLED_7B = Prism_7B_DINOSigLIP_224px_Controlled
     PRISM_DINOSIGLIP_224PX_7B = Prism_7B_DINOSigLIP_224px
+
+    # === TARGE ===
+    EXP_TARGE_DINOSIGLIP_224PX_7B = Exp_7B_Targe_DINOSigLIP_224px
 
     @property
     def model_id(self) -> str:

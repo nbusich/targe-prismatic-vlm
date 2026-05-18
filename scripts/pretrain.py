@@ -71,6 +71,12 @@ class PretrainConfig:
     run_root_dir: Path = Path("runs")                               # Path to directory to store logs & checkpoints
     seed: int = 7                                                   # Random seed (for reproducibility)
 
+    # Training schedule for the Gumbel router (consumed by the train loop, not the module)
+    selector_tau_start: float = 1.0
+    selector_tau_end: float = 0.1
+    selector_lambda_target: float = 0.05
+    selector_lambda_warmup_ratio: float = 0.1                       # fraction of total steps before L1 kicks in
+
     # HF Hub Credentials (for any gated models)
     hf_token: Union[str, Path] = Path(".hf_token")                  # Environment variable or Path to HF Token
 
@@ -94,7 +100,7 @@ class PretrainConfig:
             self.max_grad_norm = self.model.align_max_grad_norm
             self.lr_scheduler_type = self.model.align_lr_scheduler_type
             self.warmup_ratio = self.model.align_warmup_ratio
-
+            
             self.train_strategy = self.model.align_train_strategy
 
         elif self.stage.endswith("finetune"):
@@ -165,6 +171,11 @@ def pretrain(cfg: PretrainConfig) -> None:
         vision_backbone,
         llm_backbone,
         enable_mixed_precision_training=cfg.model.enable_mixed_precision_training,
+        selector_kwargs={
+          "num_heads": cfg.model.selector_num_heads,
+          "num_compressed_tokens": cfg.model.selector_num_compressed_tokens,
+          "inference_k": cfg.model.selector_inference_k,
+      },
     )
 
     # [Explicit] Call to `freeze_backbones` here for clarity => will log exactly what is frozen / what's not!
@@ -206,6 +217,10 @@ def pretrain(cfg: PretrainConfig) -> None:
         enable_mixed_precision_training=cfg.model.enable_mixed_precision_training,
         reduce_in_full_precision=cfg.model.reduce_in_full_precision,
         worker_init_fn=worker_init_fn,
+        selector_tau_start=cfg.selector_tau_start,
+        selector_tau_end=cfg.selector_tau_end,
+        selector_lambda_target=cfg.selector_lambda_target,
+        selector_lambda_warmup_ratio=cfg.selector_lambda_warmup_ratio
     )
     train_strategy.run_setup(run_dir=run_dir, n_train_examples=len(train_dataset))
 
