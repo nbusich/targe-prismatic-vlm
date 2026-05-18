@@ -38,9 +38,11 @@ def get_train_strategy(
     mixed_precision_dtype: torch.dtype = torch.bfloat16,
     worker_init_fn: Optional[Callable[[int], None]] = None,
     selector_tau_start: float = 1.0,
-    selector_tau_end: float = 0.1,
+    selector_tau_end: float = 0.5,
+    selector_tau_hold_ratio: float = 0.2,
     selector_lambda_target: float = 0.05,
     selector_lambda_warmup_ratio: float = 0.1,
+    selector_target_keep_ratio: float = 0.5,
 ) -> TrainingStrategy:
     if train_strategy in TRAIN_STRATEGIES:
         strategy_cfg = TRAIN_STRATEGIES[train_strategy]
@@ -63,8 +65,10 @@ def get_train_strategy(
             worker_init_fn=worker_init_fn,
             selector_tau_start=selector_tau_start,
             selector_tau_end=selector_tau_end,
+            selector_tau_hold_ratio=selector_tau_hold_ratio,
             selector_lambda_target=selector_lambda_target,
             selector_lambda_warmup_ratio=selector_lambda_warmup_ratio,
+            selector_target_keep_ratio=selector_target_keep_ratio,
             **strategy_cfg["kwargs"],
         )
         return strategy

@@ -51,9 +51,11 @@ class TrainingStrategy(ABC):
         reduce_in_full_precision: bool = False,
         mixed_precision_dtype: torch.dtype = torch.bfloat16,
         selector_tau_start: float = 1.0,
-        selector_tau_end: float = 0.1,
+        selector_tau_end: float = 0.5,
+        selector_tau_hold_ratio: float = 0.2,
         selector_lambda_target: float = 0.05,
         selector_lambda_warmup_ratio: float = 0.1,
+        selector_target_keep_ratio: float = 0.5,
         worker_init_fn: Optional[Callable[[int], None]] = None,
         **_: str,
     ) -> None:
@@ -85,8 +87,10 @@ class TrainingStrategy(ABC):
         # Selector schedule parameters
         self.selector_tau_start = selector_tau_start
         self.selector_tau_end = selector_tau_end
+        self.selector_tau_hold_ratio = selector_tau_hold_ratio
         self.selector_lambda_target = selector_lambda_target
         self.selector_lambda_warmup_ratio = selector_lambda_warmup_ratio
+        self.selector_target_keep_ratio = selector_target_keep_ratio
 
         # Lightweight Validation
         assert (
@@ -193,12 +197,19 @@ class TrainingStrategy(ABC):
                     projector_inner = getattr(projector, "module", projector)
                     if hasattr(projector_inner, "tau") and getattr(projector_inner, "selector", None) is not None:
                         total = self.max_steps if self.max_steps is not None else len(dataloader) * self.epochs
-                        tau_progress = metrics.global_step / max(1, total)
-                        projector_inner.tau = max(
-                            self.selector_tau_end,
-                            self.selector_tau_start
-                            - (self.selector_tau_start - self.selector_tau_end) * tau_progress,
-                        )
+                        # Hold tau at `tau_start` for the first `hold_ratio` of training, then linearly
+                        # anneal to `tau_end` over the remainder — gives the router time to settle before
+                        # logits get sharpened.
+                        hold_steps = int(self.selector_tau_hold_ratio * total)
+                        if metrics.global_step < hold_steps:
+                            projector_inner.tau = self.selector_tau_start
+                        else:
+                            anneal_progress = (metrics.global_step - hold_steps) / max(1, total - hold_steps)
+                            projector_inner.tau = max(
+                                self.selector_tau_end,
+                                self.selector_tau_start
+                                - (self.selector_tau_start - self.selector_tau_end) * anneal_progress,
+                            )
 
                     # [Contract] self.vlm.forward() must automatically compute `loss` and return!
                     with torch.autocast(
@@ -215,14 +226,18 @@ class TrainingStrategy(ABC):
                         )
                         loss = output.loss
 
-                        # --- TARGE: L1 sparsity on keep_probs ---
+                        # --- TARGE: two-sided sparsity penalty around `selector_target_keep_ratio` ---
+                        # Pull mean keep prob toward target rather than monotonically toward 0 — prevents
+                        # the router from collapsing to all-compress (and avoids the inverse all-keep mode
+                        # that NaNs MHA when every token is padded).
                         keep_probs = getattr(projector_inner, "latest_keep_probs", None)
                         if keep_probs is not None:
                             total = self.max_steps if self.max_steps is not None else len(dataloader) * self.epochs
                             warmup = int(self.selector_lambda_warmup_ratio * total)
                             if metrics.global_step >= warmup:
                                 ramp = min(1.0, (metrics.global_step - warmup) / max(1, total - warmup))
-                                loss = loss + self.selector_lambda_target * ramp * keep_probs.mean()
+                                keep_gap = keep_probs.mean() - self.selector_target_keep_ratio
+                                loss = loss + self.selector_lambda_target * ramp * keep_gap.pow(2)
 
                     # Commit Loss (Prior to Gradient Accumulation Normalization)
                     metrics.commit(loss=loss)
