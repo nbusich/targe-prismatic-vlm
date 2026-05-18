@@ -119,14 +119,13 @@ class HFCausalLLMBackbone(LLMBackbone, ABC):
             # with `attn_implementation`. Map old -> new here so the backbone API stays
             # backwards-compatible at the call site.
             attn_impl = "flash_attention_2" if use_flash_attention_2 else "sdpa"
+            # NOTE: older prismatic also passed `do_sample/temperature/top_p` here to silence
+            # HF warnings, but transformers >=4.40 no longer accepts generation-config kwargs
+            # on `from_pretrained` — they belong on `GenerationConfig` at `.generate()` time.
             self.llm = llm_cls.from_pretrained(
                 hf_hub_path,
                 token=hf_token,
                 attn_implementation=attn_impl,
-                # The following parameters are set to prevent `UserWarnings` from HF; we want greedy decoding!
-                do_sample=False,
-                temperature=1.0,
-                top_p=1.0,
             )
 
         # [Contract] `inference_mode` means we're loading from a pretrained checkpoint; no need to load base weights!
