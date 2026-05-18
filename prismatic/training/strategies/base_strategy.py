@@ -193,11 +193,11 @@ class TrainingStrategy(ABC):
                     projector_inner = getattr(projector, "module", projector)
                     if hasattr(projector_inner, "tau") and getattr(projector_inner, "selector", None) is not None:
                         total = self.max_steps if self.max_steps is not None else len(dataloader) * self.epochs
-                        progress = metrics.global_step / max(1, total)
+                        tau_progress = metrics.global_step / max(1, total)
                         projector_inner.tau = max(
                             self.selector_tau_end,
                             self.selector_tau_start
-                            - (self.selector_tau_start - self.selector_tau_end) * progress,
+                            - (self.selector_tau_start - self.selector_tau_end) * tau_progress,
                         )
 
                     # [Contract] self.vlm.forward() must automatically compute `loss` and return!
