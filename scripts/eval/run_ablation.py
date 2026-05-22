@@ -75,7 +75,7 @@ class AblationConfig:
     out_json: Path = Path("ablation_results.json")
 
     max_examples: Optional[int] = None
-    max_new_tokens: int = 64
+    max_new_tokens: int = 32      # lowered from 64 — repetition penalty + early stop keep gens short
     timing_warmup: int = 5
     timing_iters: int = 20
 
@@ -166,12 +166,18 @@ def _generate_text(vlm, input_ids, pixel_values, max_new_tokens) -> str:
     tokenizer = vlm.llm_backbone.tokenizer
     autocast_dtype = vlm.llm_backbone.half_precision_dtype
     with torch.autocast("cuda", dtype=autocast_dtype, enabled=vlm.enable_mixed_precision_training):
+        # Anti-repetition: align-only checkpoints love to loop the same trigram until
+        # max_new_tokens is exhausted, which dominates eval runtime. The repetition_penalty
+        # + no_repeat_ngram_size combo plus EOS-based early stopping keeps generations short.
         generated_ids = super(type(vlm), vlm).generate(
             input_ids=input_ids,
             pixel_values=pixel_values,
             do_sample=False,
             max_new_tokens=max_new_tokens,
             min_length=1,
+            no_repeat_ngram_size=3,
+            repetition_penalty=1.15,
+            early_stopping=True,
         )
     return tokenizer.decode(generated_ids[0, input_ids.shape[1] :], skip_special_tokens=True).strip()
 
