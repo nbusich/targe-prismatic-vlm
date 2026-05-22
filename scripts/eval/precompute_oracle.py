@@ -157,6 +157,16 @@ def main(cfg: OracleConfig) -> None:
     vlm.to(device, dtype=torch.bfloat16)
     vlm.eval()
 
+    # The default LLM backbone is built with SDPA attention, whose kernel does not return
+    # attention weights, so `output_attentions=True` silently yields `attentions=None`.
+    # HF Llama-family models dispatch attention via `self.config._attn_implementation` at
+    # each forward, so flipping it on the loaded config propagates to every layer.
+    inner_llm = vlm.llm_backbone.llm
+    inner_llm.config._attn_implementation = "eager"
+    if hasattr(inner_llm.config, "attn_implementation"):
+        inner_llm.config.attn_implementation = "eager"
+    overwatch.info("Forced LLM attention implementation -> `eager` (required for output_attentions).")
+
     # Force "full" route + no Q-Former so the LLM sees every projected ViT token.
     assert hasattr(vlm.projector, "route_mode"), "Projector lacks ablation routing; rebuild from latest code."
     vlm.projector.route_mode = "full"
