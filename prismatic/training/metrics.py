@@ -134,6 +134,7 @@ class Metrics:
         self.state = {
             "loss_raw": deque(maxlen=grad_accumulation_steps),
             "loss": deque(maxlen=window_size),
+            "aux_attn_loss": deque(maxlen=window_size),
             "step_time": deque(maxlen=window_size),
             "lr": [],
         }
@@ -188,16 +189,18 @@ class Metrics:
 
         # Fire to Trackers
         prefix = self.stage.capitalize()
-        self.log(
-            self.global_step,
-            metrics={
-                f"{prefix}/Step": self.global_step,
-                f"{prefix}/Loss": loss,
-                f"{prefix}/Loss (Raw)": loss_raw,
-                f"{prefix}/Learning Rate": lr,
-                f"{prefix}/Step Time": step_time,
-            },
-        )
+        payload = {
+            f"{prefix}/Step": self.global_step,
+            f"{prefix}/Loss": loss,
+            f"{prefix}/Loss (Raw)": loss_raw,
+            f"{prefix}/Learning Rate": lr,
+            f"{prefix}/Step Time": step_time,
+        }
+        # Surface optional aux-attn-loss when active (only meaningful when training with `--aux_attn_enabled`).
+        aux_buf = self.state.get("aux_attn_loss")
+        if aux_buf is not None and len(aux_buf) > 0:
+            payload[f"{prefix}/Aux Attn Loss"] = torch.stack(list(aux_buf)).float().mean().item()
+        self.log(self.global_step, metrics=payload)
         return status
 
     def finalize(self) -> str:

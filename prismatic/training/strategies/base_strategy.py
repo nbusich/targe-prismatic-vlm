@@ -14,6 +14,7 @@ from typing import Callable, Optional
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from tqdm import tqdm
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -59,6 +60,9 @@ class TrainingStrategy(ABC):
         worker_init_fn: Optional[Callable[[int], None]] = None,
         num_workers: Optional[int] = None,
         pin_memory: bool = True,
+        aux_attn_enabled: bool = True,
+        aux_attn_weight: float = 1.0,
+        aux_attn_layers: tuple = (0,),
         **_: str,
     ) -> None:
         self.vlm, self.device_id = vlm, device_id
@@ -93,6 +97,11 @@ class TrainingStrategy(ABC):
 
         # First-backward gradient audit (one-shot; verifies the selector/Q-Former graph isn't severed)
         self._grad_audit_done = False
+
+        # Auxiliary attention-distillation loss (selector keep_probs ↔ LLM first-layer attention).
+        self.aux_attn_enabled = aux_attn_enabled
+        self.aux_attn_weight = float(aux_attn_weight)
+        self.aux_attn_layers = tuple(aux_attn_layers) if aux_attn_layers is not None else (0,)
 
         # Selector schedule parameters
         self.selector_tau_start = selector_tau_start
@@ -240,6 +249,7 @@ class TrainingStrategy(ABC):
                             pixel_values=batch["pixel_values"],
                             labels=batch["labels"],
                             multimodal_indices=batch["multimodal_indices"],
+                            output_attentions=self.aux_attn_enabled,
                         )
                         loss = output.loss
 
@@ -255,6 +265,45 @@ class TrainingStrategy(ABC):
                                 ramp = min(1.0, (metrics.global_step - warmup) / max(1, total - warmup))
                                 keep_gap = keep_probs.mean() - self.selector_target_keep_ratio
                                 loss = loss + self.selector_lambda_target * ramp * keep_gap.pow(2)
+
+                        # --- TARGE: attention-distillation auxiliary loss ---------------------------
+                        # MSE between selector's continuous keep_probs (shape (B, N)) and the LLM's
+                        # first-layer attention from response→visual positions (mean over heads,
+                        # max-normalized, detached so no grad flows into the LLM).
+                        aux_loss_val = None
+                        if (
+                            self.aux_attn_enabled
+                            and keep_probs is not None
+                            and getattr(output, "attentions", None)
+                        ):
+                            try:
+                                N = keep_probs.shape[1]
+                                M = int(getattr(projector_inner, "num_compressed_tokens", 0) or 0)
+                                attns = output.attentions
+                                # Average across the requested early layers (default: layer 0 only).
+                                layer_ids = [li for li in self.aux_attn_layers if 0 <= li < len(attns)]
+                                if layer_ids:
+                                    stacked = torch.stack([attns[li] for li in layer_ids], dim=0)
+                                    avg_attn = stacked.float().mean(dim=(0, 2))  # (B, S, S)
+                                    S = avg_attn.shape[-1]
+                                    visual_slice = slice(1, 1 + N)
+                                    response_start = 1 + N + M
+                                    if response_start < S:
+                                        tgt = avg_attn[:, response_start:S, visual_slice].sum(dim=1)
+                                    else:
+                                        # Degenerate: no response tokens — fall back to last position.
+                                        tgt = avg_attn[:, -1:, visual_slice].sum(dim=1)
+                                    tgt = tgt / (tgt.amax(dim=-1, keepdim=True) + 1e-8)
+                                    tgt = tgt.detach()  # NO backprop into the frozen LLM
+                                    aux_loss_val = F.mse_loss(keep_probs.float(), tgt)
+                                    loss = loss + self.aux_attn_weight * aux_loss_val
+                            except Exception as _aux_e:
+                                # Don't let a malformed batch kill the training loop — log & skip aux.
+                                overwatch.warning(
+                                    f"[aux-attn] step={metrics.global_step} skipped "
+                                    f"({type(_aux_e).__name__}: {_aux_e})"
+                                )
+                                aux_loss_val = None
 
                     # --- NaN/Inf guard: diagnose blow-ups before they corrupt optimizer state ---
                     if not torch.isfinite(loss):
@@ -279,7 +328,11 @@ class TrainingStrategy(ABC):
                         continue
 
                     # Commit Loss (Prior to Gradient Accumulation Normalization)
-                    metrics.commit(loss=loss)
+                    # `metrics.commit` calls `.detach()` on every kwarg, so values must be tensors.
+                    if aux_loss_val is not None:
+                        metrics.commit(loss=loss, aux_attn_loss=aux_loss_val)
+                    else:
+                        metrics.commit(loss=loss)
 
                     # Normalize Loss to account for Gradient Accumulation --> Backward!
                     # [IMPORTANT] Technically speaking, doing gradient accumulation in this way is "incorrect"; this is

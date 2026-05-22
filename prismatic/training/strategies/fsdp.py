@@ -67,6 +67,9 @@ class FSDPStrategy(TrainingStrategy):
         selector_target_keep_ratio: float = 0.5,
         num_workers: Optional[int] = None,
         pin_memory: bool = True,
+        aux_attn_enabled: bool = True,
+        aux_attn_weight: float = 1.0,
+        aux_attn_layers: tuple = (0,),
     ) -> None:
         super().__init__(
             vlm=vlm,
@@ -93,6 +96,9 @@ class FSDPStrategy(TrainingStrategy):
             selector_target_keep_ratio=selector_target_keep_ratio,
             num_workers=num_workers,
             pin_memory=pin_memory,
+            aux_attn_enabled=aux_attn_enabled,
+            aux_attn_weight=aux_attn_weight,
+            aux_attn_layers=aux_attn_layers,
         )
 
         # FSDP-Specific Parameters

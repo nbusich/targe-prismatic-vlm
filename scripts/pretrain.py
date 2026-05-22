@@ -86,6 +86,13 @@ class PretrainConfig:
     selector_lambda_warmup_ratio: float = 0.1                       # fraction of total steps before sparsity penalty kicks in
     selector_target_keep_ratio: float = 0.5                         # two-sided target for mean keep prob
 
+    # Auxiliary attention-distillation loss for the selector.
+    # MSE pulls `latest_keep_probs` toward the LLM's first-layer attention from response→visual,
+    # giving the router a dense gradient signal independent of the Gumbel top-k bottleneck.
+    aux_attn_enabled: bool = True
+    aux_attn_weight: float = 1.0
+    aux_attn_layers: Tuple[int, ...] = (0,)
+
     # DataLoader Parameters
     # `num_workers=None` → auto-scale to min(8, cpu_count). Set explicitly to override.
     num_workers: Optional[int] = None
@@ -195,6 +202,17 @@ def pretrain(cfg: PretrainConfig) -> None:
       },
     )
 
+    # The LLM is built with SDPA attention, which silently returns `None` for attention
+    # weights. The auxiliary attention-distillation loss needs real tensors, so flip the
+    # underlying LLM config to eager attention. Llama-family models dispatch via
+    # `self.config._attn_implementation` per forward, so this propagates to every layer.
+    if cfg.aux_attn_enabled:
+        inner_llm = vlm.llm_backbone.llm
+        inner_llm.config._attn_implementation = "eager"
+        if hasattr(inner_llm.config, "attn_implementation"):
+            inner_llm.config.attn_implementation = "eager"
+        overwatch.info("Aux-attn loss enabled → forced LLM attn_implementation to `eager`.")
+
     # [Explicit] Call to `freeze_backbones` here for clarity => will log exactly what is frozen / what's not!
     overwatch.info(f"Invoking `VLM.freeze_backbones()` for `{model_id}` => Training Stage: `{cfg.stage}`")
     vlm.freeze_backbones(cfg.stage)
@@ -242,6 +260,9 @@ def pretrain(cfg: PretrainConfig) -> None:
         selector_target_keep_ratio=cfg.selector_target_keep_ratio,
         num_workers=cfg.num_workers,
         pin_memory=cfg.pin_memory,
+        aux_attn_enabled=cfg.aux_attn_enabled,
+        aux_attn_weight=cfg.aux_attn_weight,
+        aux_attn_layers=cfg.aux_attn_layers,
     )
     train_strategy.run_setup(run_dir=run_dir, n_train_examples=len(train_dataset))
 
