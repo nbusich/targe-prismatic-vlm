@@ -15,15 +15,24 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Type
 
 import torch
-from PIL import Image
+from PIL import Image, ImageFile, UnidentifiedImageError
 from torch.utils.data import Dataset
 from transformers import CodeGenTokenizerFast, LlamaTokenizerFast, PreTrainedTokenizerBase
 
+from prismatic.overwatch import initialize_overwatch
 from prismatic.models.backbones.llm.prompting import PromptBuilder
 from prismatic.models.backbones.vision import ImageTransform
 
+# Allow PIL to load partial JPEGs (truncated downloads) instead of raising OSError mid-decode.
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+overwatch = initialize_overwatch(__name__)
+
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
 IGNORE_INDEX = -100
+
+# Errors raised by PIL on unreadable / corrupt / missing image files. We skip these rather than crash training.
+_BAD_IMAGE_ERRORS = (UnidentifiedImageError, OSError, FileNotFoundError, SyntaxError, ValueError)
 
 
 class AlignDataset(Dataset[Dict[str, torch.Tensor]]):
@@ -84,7 +93,12 @@ class AlignDataset(Dataset[Dict[str, torch.Tensor]]):
         labels[0] = IGNORE_INDEX
 
         # Process Image --> get "pixel_values" (will either be a torch.Tensor OR a Dict[str,torch.Tensor])
-        pixel_values = self.image_transform(Image.open(self.image_dir / image_path).convert("RGB"))
+        # Fall back to the next example if this image is corrupt/missing rather than crashing the dataloader.
+        try:
+            pixel_values = self.image_transform(Image.open(self.image_dir / image_path).convert("RGB"))
+        except _BAD_IMAGE_ERRORS as ex:
+            overwatch.warning(f"[AlignDataset] Skipping bad image idx={idx} path={image_path} ({type(ex).__name__}: {ex})")
+            return self.__getitem__((idx + 1) % len(self.examples))
 
         return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
 
@@ -179,7 +193,12 @@ class FinetuneDataset(Dataset[Dict[str, torch.Tensor]]):
             labels[0] = IGNORE_INDEX
 
             # Process Image --> get "pixel_values" (will either be a torch.Tensor OR a Dict[str,torch.Tensor])
-            pixel_values = self.image_transform(Image.open(self.image_dir / image_path).convert("RGB"))
+            # Fall back to the next example if this image is corrupt/missing rather than crashing the dataloader.
+            try:
+                pixel_values = self.image_transform(Image.open(self.image_dir / image_path).convert("RGB"))
+            except _BAD_IMAGE_ERRORS as ex:
+                overwatch.warning(f"[FinetuneDataset] Skipping bad image idx={idx} path={image_path} ({type(ex).__name__}: {ex})")
+                return self.__getitem__((idx + 1) % len(self.examples))
 
             return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
 
