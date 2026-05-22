@@ -243,33 +243,13 @@ class TrainingStrategy(ABC):
                         )
                         loss = output.loss
 
-                        # --- TARGE: two-sided sparsity penalty around `selector_target_keep_ratio` ---
-                        # Pull mean keep prob toward target rather than monotonically toward 0 — prevents
-                        # the router from collapsing to all-compress (and avoids the inverse all-keep mode
-                        # that NaNs MHA when every token is padded).
-                        keep_probs = getattr(projector_inner, "latest_keep_probs", None)
-                        if keep_probs is not None:
-                            total = self.max_steps if self.max_steps is not None else len(dataloader) * self.epochs
-                            warmup = int(self.selector_lambda_warmup_ratio * total)
-                            if metrics.global_step >= warmup:
-                                ramp = min(1.0, (metrics.global_step - warmup) / max(1, total - warmup))
-                                keep_gap = keep_probs.mean() - self.selector_target_keep_ratio
-                                loss = loss + self.selector_lambda_target * ramp * keep_gap.pow(2)
-
                     # --- NaN/Inf guard: diagnose blow-ups before they corrupt optimizer state ---
                     if not torch.isfinite(loss):
-                        ce_loss = output.loss
                         diag = {
                             "step": metrics.global_step,
                             "tau": getattr(projector_inner, "tau", None),
-                            "ce_loss": ce_loss.item() if torch.isfinite(ce_loss) else float(ce_loss),
-                            "total_loss": float(loss),
+                            "ce_loss": float(loss),
                         }
-                        if keep_probs is not None:
-                            diag["keep_probs_mean"] = keep_probs.float().mean().item()
-                            diag["keep_probs_min"] = keep_probs.float().min().item()
-                            diag["keep_probs_max"] = keep_probs.float().max().item()
-                            diag["keep_probs_has_nan"] = bool(torch.isnan(keep_probs).any().item())
                         for name, p in projector_inner.named_parameters():
                             if not torch.isfinite(p).all():
                                 diag[f"param_{name}_nonfinite"] = True
