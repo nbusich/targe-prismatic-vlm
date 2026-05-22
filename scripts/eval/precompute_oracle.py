@@ -86,11 +86,14 @@ def _extract_oracle_indices(
     labels = input_ids.clone()
     labels[:, 0] = -100  # mark BOS as ignore, consistent with the train collator contract
 
+    # The VLM is fully cast to bf16 upstream, so pixel_values must match — PIL transforms
+    # return float32, which would otherwise collide with the bf16 vision-backbone weights.
+    model_dtype = next(vlm.vision_backbone.parameters()).dtype
     pixel_values = image_transform(image)
     if isinstance(pixel_values, torch.Tensor):
-        pixel_values = pixel_values[None, ...].to(device)
+        pixel_values = pixel_values[None, ...].to(device=device, dtype=model_dtype)
     elif isinstance(pixel_values, dict):
-        pixel_values = {k: v[None, ...].to(device) for k, v in pixel_values.items()}
+        pixel_values = {k: v[None, ...].to(device=device, dtype=model_dtype) for k, v in pixel_values.items()}
     else:
         raise ValueError(f"Unexpected pixel_values type: {type(pixel_values)}")
 
