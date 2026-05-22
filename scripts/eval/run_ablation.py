@@ -86,7 +86,10 @@ class AblationConfig:
     # fmt: on
 
 
-def _flatten_conv(conv: List[dict]) -> Tuple[str, str]:
+def _flatten_conv(conv) -> Tuple[str, str]:
+    # Some chat.json variants store `conversations` as a JSON-encoded string instead of a list.
+    if isinstance(conv, str):
+        conv = json.loads(conv)
     human = next((t["value"] for t in conv if t.get("from") == "human"), "")
     gpt = next((t["value"] for t in conv if t.get("from") == "gpt"), "")
     return human.replace("<image>", "").strip(), gpt.strip()
