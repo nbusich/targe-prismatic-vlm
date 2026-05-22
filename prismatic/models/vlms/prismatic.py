@@ -120,14 +120,22 @@ class PrismaticVLM(VLM):
             selector_kwargs=selector_kwargs
         )
 
-        # Load from Checkpoint (Custom --> should load both *projector* and *llm* weights)
+        # Load from Checkpoint. Align-stage checkpoints contain only `projector`; finetune-stage
+        # checkpoints additionally contain `llm_backbone`. The LLM is already initialized from
+        # pretrained HF weights upstream, so a missing `llm_backbone` key is fine — it just means
+        # the LLM stays at its frozen-during-align state.
         model_state_dict = torch.load(pretrained_checkpoint, map_location="cpu")["model"]
-        assert (
-            "projector" in model_state_dict and "llm_backbone" in model_state_dict
-        ), "PrismaticVLM `from_pretrained` expects checkpoint with keys for `projector` AND `llm_backbone`!"
+        assert "projector" in model_state_dict, (
+            "PrismaticVLM `from_pretrained` expects at least a `projector` key in the checkpoint!"
+        )
 
         vlm.projector.load_state_dict(model_state_dict["projector"])
-        vlm.llm_backbone.load_state_dict(model_state_dict["llm_backbone"])
+        if "llm_backbone" in model_state_dict:
+            vlm.llm_backbone.load_state_dict(model_state_dict["llm_backbone"])
+        else:
+            overwatch.info(
+                "Checkpoint has `projector` only (align-stage) — leaving LLM at pretrained HF weights."
+            )
 
         # Freeze Weights
         vlm.requires_grad_(False)
