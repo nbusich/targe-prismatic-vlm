@@ -94,16 +94,18 @@ def _extract_oracle_indices(
     else:
         raise ValueError(f"Unexpected pixel_values type: {type(pixel_values)}")
 
-    autocast_dtype = vlm.llm_backbone.half_precision_dtype
-    with torch.autocast("cuda", dtype=autocast_dtype, enabled=vlm.enable_mixed_precision_training):
-        output = vlm(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            pixel_values=pixel_values,
-            labels=labels,
-            output_attentions=True,
-            return_dict=True,
-        )
+    # NOTE: Do NOT wrap in `torch.autocast` here. The VLM is already fully cast to bf16
+    # via `vlm.to(device, dtype=torch.bfloat16)` upstream; layering autocast on top of an
+    # eager-attention forward (needed for `output_attentions=True`) causes a dtype clash
+    # inside the attention mask broadcast ("expected Float but found BFloat16").
+    output = vlm(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        pixel_values=pixel_values,
+        labels=labels,
+        output_attentions=True,
+        return_dict=True,
+    )
 
     # output.attentions: tuple of length num_layers, each (B=1, num_heads, seq, seq)
     # Visual tokens occupy positions [1, 1 + V), where V = projector output length.
