@@ -51,6 +51,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from run_ablation import (  # noqa: E402
     _capture_connector_output,
     _connector_flops,
+    _connector_from_features,
+    _emit_status,
     _flatten_conv,
     _generate_text,
     _get_patch_features,
@@ -58,7 +60,9 @@ from run_ablation import (  # noqa: E402
     _prep_inputs,
     _set_route,
     _time_connector,
+    _vision_features,
 )
+import time  # for status timing
 
 overwatch = initialize_overwatch(__name__)
 
@@ -94,6 +98,8 @@ class KQSweepConfig:
     max_new_tokens: int = 16                   # tight cap — anti-repetition + early stop emit EOS usually sooner
     timing_warmup: int = 5
     timing_iters: int = 20
+    # Logging cadence — print a flushed status line every N items in any inner loop.
+    log_every: int = 50
 
     hf_token: Union[str, Path] = Path(".hf_token")
     # fmt: on
@@ -185,6 +191,66 @@ def main(cfg: KQSweepConfig) -> None:
             pope_items = pope_items[: cfg.pope_max_examples]
         overwatch.info(f"POPE items per cell: {len(pope_items):,}")
 
+    # ─── Precompute vision features + Group A reference latents (once) ─────────
+    # These are invariant across (K, Q, group) cells, so caching once eliminates
+    # ~30 redundant vision-backbone forwards per heldout example. CPU storage
+    # keeps GPU memory free for cell-specific projector forwards.
+    overwatch.info("Precomputing vision features + Group A reference latents for heldout...")
+    _pre_t0 = time.time()
+    model_dtype = next(vlm.vision_backbone.parameters()).dtype
+    image_transform = vlm.vision_backbone.image_transform
+
+    heldout_cache: List[Optional[dict]] = []
+    for _pre_idx, ex in enumerate(heldout):
+        try:
+            img_rel = ex.get("image")
+            ex_id = str(ex.get("id") or img_rel)
+            if not img_rel:
+                heldout_cache.append(None); continue
+            img_path = cfg.image_root / img_rel
+            if not img_path.is_file():
+                heldout_cache.append(None); continue
+            human, _ = _flatten_conv(ex.get("conversations", []))
+            if not human:
+                heldout_cache.append(None); continue
+
+            img = Image.open(img_path).convert("RGB")
+            pv = image_transform(img)
+            if isinstance(pv, dict):
+                pv_gpu = {k: v[None, ...].to(device=device, dtype=model_dtype) for k, v in pv.items()}
+                pv_cpu = {k: v.detach().cpu() for k, v in pv_gpu.items()}
+            else:
+                pv_gpu = pv[None, ...].to(device=device, dtype=model_dtype)
+                pv_cpu = pv_gpu.detach().cpu()
+
+            pf_gpu = _vision_features(vlm, pv_gpu)
+            pf_cpu = pf_gpu.detach().cpu() if isinstance(pf_gpu, torch.Tensor) else {
+                k: v.detach().cpu() for k, v in pf_gpu.items()
+            }
+
+            # Group A reference latent — projector with full + no Q-Former, independent of K/Q.
+            _set_route(projector, "full", False, None)
+            ref_latent_cpu = _connector_from_features(vlm, pf_gpu).float().flatten(1).detach().cpu()
+
+            heldout_cache.append({
+                "ex_id": ex_id,
+                "prompt": human,
+                "patch_features_cpu": pf_cpu,
+                "pixel_values_cpu": pv_cpu,
+                "ref_latent_cpu": ref_latent_cpu,
+            })
+        except Exception as _e:
+            heldout_cache.append(None)
+
+        if (_pre_idx + 1) % cfg.log_every == 0 or (_pre_idx + 1) == len(heldout):
+            _emit_status("precompute/heldout", _pre_idx + 1, len(heldout), _pre_t0)
+
+    n_cached = sum(1 for h in heldout_cache if h is not None)
+    overwatch.info(
+        f"[precompute] {n_cached}/{len(heldout)} heldout cached in "
+        f"{time.time() - _pre_t0:.1f}s"
+    )
+
     # Result container.
     cells: Dict[str, dict] = {}
     payload = {
@@ -249,24 +315,24 @@ def main(cfg: KQSweepConfig) -> None:
                 }
 
                 # ---- per-example: cos vs A + (optional) IoU vs oracle + gen ----
-                for ex in tqdm(heldout, desc=cell_id, leave=False):
-                    ex_id = str(ex.get("id") or ex.get("image"))
+                # Uses precomputed heldout_cache so vision_backbone runs 0 times in the cos pass.
+                _cell_t0 = time.time()
+                tokenizer = vlm.llm_backbone.tokenizer
+                for _ex_idx, cache_entry in enumerate(tqdm(heldout_cache, desc=cell_id, leave=False)):
+                    if cache_entry is None:
+                        continue
+                    ex_id = cache_entry["ex_id"]
                     try:
-                        img_rel = ex.get("image")
-                        if not img_rel:
-                            continue
-                        img_path = cfg.image_root / img_rel
-                        if not img_path.is_file():
-                            continue
-                        image = Image.open(img_path).convert("RGB")
-                        human, _ = _flatten_conv(ex.get("conversations", []))
-                        if not human:
-                            continue
-
-                        input_ids, pixel_values = _prep_inputs(vlm, image, human)
+                        # Move cached tensors to GPU (cheap — they live on CPU).
+                        pf_cpu = cache_entry["patch_features_cpu"]
+                        if isinstance(pf_cpu, torch.Tensor):
+                            patch_features_gpu = pf_cpu.to(device, non_blocking=True)
+                        else:
+                            patch_features_gpu = {k: v.to(device, non_blocking=True) for k, v in pf_cpu.items()}
+                        ref_latent = cache_entry["ref_latent_cpu"].to(device, non_blocking=True)
 
                         # Oracle indices for this cell: truncated to K.
-                        oracle_idx = oracle_table.get(ex_id)
+                        oracle_idx = oracle_table.get(ex_id) if oracle_table else None
                         oracle_idx_dev = None
                         if opt["route_mode"] == "oracle":
                             if oracle_idx is None:
@@ -274,19 +340,13 @@ def main(cfg: KQSweepConfig) -> None:
                             k_eff = min(K, oracle_idx.shape[0])
                             oracle_idx_dev = oracle_idx[:k_eff].to(device).unsqueeze(0)
 
-                        # Group-A reference latent for cosine sim.
-                        _set_route(projector, "full", False, None)
-                        ref_latent = _capture_connector_output(vlm, pixel_values).float().flatten(1)
-
-                        # Cell's routing.
+                        # Cell's routing — uses cached patch features (no vision_backbone forward).
                         _apply_kq(projector, K, Q, snapshot_qs, snapshot_M)
                         _set_route(projector, opt["route_mode"], use_qf, oracle_idx_dev)
+                        latent = _connector_from_features(vlm, patch_features_gpu).float().flatten(1)
 
-                        latent = _capture_connector_output(vlm, pixel_values).float().flatten(1)
                         min_dim = min(ref_latent.shape[1], latent.shape[1])
-                        cos = F.cosine_similarity(
-                            ref_latent[:, :min_dim], latent[:, :min_dim], dim=1
-                        ).item()
+                        cos = F.cosine_similarity(ref_latent[:, :min_dim], latent[:, :min_dim], dim=1).item()
                         cell_result["cos_vs_A"].append(cos)
 
                         if opt["route_mode"] == "selector" and oracle_idx is not None:
@@ -297,9 +357,21 @@ def main(cfg: KQSweepConfig) -> None:
                                     _iou(sel[0].cpu(), oracle_idx[:k_eff])
                                 )
 
+                        # Generation still re-runs vision_backbone inside vlm.generate (acceptable cost
+                        # at 16 tokens; can't be skipped without refactoring PrismaticVLM.forward).
+                        pv_cpu = cache_entry["pixel_values_cpu"]
+                        if isinstance(pv_cpu, torch.Tensor):
+                            pixel_values_gpu = pv_cpu.to(device, non_blocking=True)
+                        else:
+                            pixel_values_gpu = {k: v.to(device, non_blocking=True) for k, v in pv_cpu.items()}
+                        prompt_builder = vlm.get_prompt_builder()
+                        prompt_builder.add_turn(role="human", message=cache_entry["prompt"])
+                        prompt_text = prompt_builder.get_prompt()
+                        input_ids = tokenizer(prompt_text, truncation=True, return_tensors="pt").input_ids.to(device)
+
                         _set_route(projector, opt["route_mode"], use_qf, oracle_idx_dev)
-                        gen = _generate_text(vlm, input_ids, pixel_values, cfg.max_new_tokens)
-                        cell_result["generations"].append({"id": ex_id, "prompt": human, "gen": gen})
+                        gen = _generate_text(vlm, input_ids, pixel_values_gpu, cfg.max_new_tokens)
+                        cell_result["generations"].append({"id": ex_id, "prompt": cache_entry["prompt"], "gen": gen})
                         cell_result["n_generations"] += 1
 
                     except Exception as e:
@@ -309,10 +381,20 @@ def main(cfg: KQSweepConfig) -> None:
                             {"id": ex_id, "prompt": "", "gen": f"<error: {type(e).__name__}: {e}>"}
                         )
 
+                    if (_ex_idx + 1) % cfg.log_every == 0 or (_ex_idx + 1) == len(heldout_cache):
+                        cos_list = cell_result["cos_vs_A"]
+                        cos_mean = sum(cos_list) / max(1, len(cos_list)) if cos_list else None
+                        _emit_status(
+                            cell_id, _ex_idx + 1, len(heldout_cache), _cell_t0,
+                            cos=(f"{cos_mean:.3f}" if cos_mean is not None else None),
+                            ngens=cell_result["n_generations"],
+                        )
+
                 # ---- POPE accuracy for this cell ----
                 if pope_items:
                     correct = n = yes_pred = 0
-                    for item in tqdm(pope_items, desc=f"POPE/{cell_id}", leave=False):
+                    _pope_t0 = time.time()
+                    for _pope_idx, item in enumerate(tqdm(pope_items, desc=f"POPE/{cell_id}", leave=False)):
                         try:
                             img = Path(cfg.pope_image_root or cfg.image_root) / item["image"]
                             if not img.is_file():
@@ -356,6 +438,14 @@ def main(cfg: KQSweepConfig) -> None:
                         except Exception:
                             _maybe_traceback("pope", cell_id)
                             continue
+
+                        if (_pope_idx + 1) % cfg.log_every == 0 or (_pope_idx + 1) == len(pope_items):
+                            _emit_status(
+                                f"POPE/{cell_id}", _pope_idx + 1, len(pope_items), _pope_t0,
+                                acc=f"{(correct / max(1, n)):.3f}",
+                                yes_rate=f"{(yes_pred / max(1, n)):.3f}",
+                                n_valid=n,
+                            )
                     cell_result["pope"] = {
                         "accuracy": correct / n if n else None,
                         "yes_rate": yes_pred / n if n else None,

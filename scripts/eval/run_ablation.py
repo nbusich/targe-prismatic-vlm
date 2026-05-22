@@ -78,6 +78,9 @@ class AblationConfig:
     max_new_tokens: int = 16      # tight cap — repetition penalty + early stop usually emit EOS sooner
     timing_warmup: int = 5
     timing_iters: int = 20
+    # Batching + logging knobs (set high on Blackwell/H100 to actually use the GPU).
+    eval_batch_size: int = 64     # batch size for POPE forward (cos pass is per-example)
+    log_every: int = 50           # print a flushed status line every N examples
 
     hf_token: Union[str, Path] = Path(".hf_token")
     # fmt: on
@@ -87,6 +90,30 @@ def _flatten_conv(conv: List[dict]) -> Tuple[str, str]:
     human = next((t["value"] for t in conv if t.get("from") == "human"), "")
     gpt = next((t["value"] for t in conv if t.get("from") == "gpt"), "")
     return human.replace("<image>", "").strip(), gpt.strip()
+
+
+def _emit_status(tag: str, idx: int, total: int, t0: float, **stats) -> None:
+    """Flushed one-line status update so Colab actually shows progress during long evals."""
+    elapsed = time.time() - t0
+    rate = idx / max(elapsed, 1e-6)
+    eta = (total - idx) / max(rate, 1e-6)
+    extras = "  ".join(f"{k}={v}" for k, v in stats.items() if v is not None)
+    print(
+        f"[{tag}] {idx}/{total}  rate={rate:.1f}/s  elapsed={elapsed:.0f}s  ETA={eta:.0f}s  {extras}",
+        flush=True,
+    )
+
+
+@torch.inference_mode()
+def _vision_features(vlm, pixel_values):
+    """Run the vision backbone once and return patch features (no projector, no LLM)."""
+    return vlm.vision_backbone(pixel_values)
+
+
+@torch.inference_mode()
+def _connector_from_features(vlm, patch_features) -> torch.Tensor:
+    """Run only the projector on already-computed vision patch features."""
+    return vlm.projector(patch_features)
 
 
 def _iou(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -286,7 +313,9 @@ def main(cfg: AblationConfig) -> None:
             traceback.print_exc()
             first_traceback_printed["flag"] = True
 
-    for ex in tqdm(heldout, desc="ablation"):
+    _loop_t0 = time.time()
+    overwatch.info(f"Starting per-example loop: {len(heldout):,} examples, log_every={cfg.log_every}")
+    for _idx, ex in enumerate(tqdm(heldout, desc="ablation")):
         ex_id = str(ex.get("id") or ex.get("image"))
         try:
             img_rel = ex.get("image")
@@ -304,10 +333,14 @@ def main(cfg: AblationConfig) -> None:
             oracle_idx = oracle_table.get(ex_id)
             oracle_idx_dev = oracle_idx.to(device).unsqueeze(0) if oracle_idx is not None else None
 
-            # Group A reference latent for cosine similarity.
+            # Cache the vision-backbone output once per example — it's invariant across the
+            # 5 groups, so we skip 4 redundant ViT forwards per example.
+            patch_features_cached = _vision_features(vlm, pixel_values)
+
+            # Group A reference latent for cosine similarity (uses cached features).
             try:
                 _set_route(vlm.projector, "full", False, None)
-                ref_latent = _capture_connector_output(vlm, pixel_values).float().flatten(1)
+                ref_latent = _connector_from_features(vlm, patch_features_cached).float().flatten(1)
             except Exception as e:
                 _maybe_print_first_traceback("ref-latent", ex_id)
                 overwatch.info(f"[ex={ex_id}] ref-latent failed, skipping example: {type(e).__name__}: {e}")
@@ -323,8 +356,8 @@ def main(cfg: AblationConfig) -> None:
             try:
                 _set_route(vlm.projector, opt["route_mode"], opt["use_qformer"], oracle_idx_dev)
 
-                # Connector output for cosine sim.
-                latent = _capture_connector_output(vlm, pixel_values).float().flatten(1)
+                # Connector output for cosine sim (reuses cached vision features).
+                latent = _connector_from_features(vlm, patch_features_cached).float().flatten(1)
                 min_dim = min(ref_latent.shape[1], latent.shape[1])
                 cos = F.cosine_similarity(ref_latent[:, :min_dim], latent[:, :min_dim], dim=1).item()
                 results[name]["cos_vs_A"].append(cos)
@@ -352,6 +385,15 @@ def main(cfg: AblationConfig) -> None:
         except Exception as e:
             overwatch.info(f"[ex={ex_id}] partial dump failed: {type(e).__name__}: {e}")
 
+        # Periodic flushed status line — Colab buffers tqdm output so this is what you actually see.
+        if (_idx + 1) % cfg.log_every == 0 or (_idx + 1) == len(heldout):
+            cos_means = {
+                name: (sum(results[name]["cos_vs_A"]) / max(1, len(results[name]["cos_vs_A"])))
+                for name, _ in GROUPS if results[name]["cos_vs_A"]
+            }
+            cos_summary = " ".join(f"{n}={v:.3f}" for n, v in cos_means.items())
+            _emit_status("ablation", _idx + 1, len(heldout), _loop_t0, cos=cos_summary)
+
     # ---- POPE accuracy (per-group try/except so a broken group doesn't kill the rest) ----
     if pope_items:
         for name, opt in GROUPS:
@@ -359,7 +401,9 @@ def main(cfg: AblationConfig) -> None:
                 correct = 0
                 n = 0
                 yes_pred = 0
-                for item in tqdm(pope_items, desc=f"POPE/{name}"):
+                _pope_t0 = time.time()
+                overwatch.info(f"POPE/{name}: starting on {len(pope_items):,} items")
+                for _pope_idx, item in enumerate(tqdm(pope_items, desc=f"POPE/{name}")):
                     try:
                         img = Path(cfg.pope_image_root or cfg.image_root) / item["image"]
                         if not img.is_file():
@@ -398,12 +442,25 @@ def main(cfg: AblationConfig) -> None:
                         n += 1
                     except Exception:
                         continue
+
+                    # Periodic status during POPE — useful when running 3000 items per group.
+                    if (_pope_idx + 1) % cfg.log_every == 0 or (_pope_idx + 1) == len(pope_items):
+                        running_acc = correct / max(1, n)
+                        running_yes = yes_pred / max(1, n)
+                        _emit_status(
+                            f"POPE/{name}", _pope_idx + 1, len(pope_items), _pope_t0,
+                            acc=f"{running_acc:.3f}", yes_rate=f"{running_yes:.3f}", n_valid=n,
+                        )
                 pope_metrics[name] = {
                     "accuracy": correct / n if n else None,
                     "yes_rate": yes_pred / n if n else None,
                     "n": n,
                 }
                 _dump_partial(cfg.out_json, results, pope_metrics, hw_metrics, cfg)
+                overwatch.info(
+                    f"[POPE/{name}] done. acc={pope_metrics[name]['accuracy']}  "
+                    f"yes_rate={pope_metrics[name]['yes_rate']}  n={n}"
+                )
             except Exception as e:
                 pope_metrics[name] = {"error": f"{type(e).__name__}: {e}"}
 
