@@ -75,7 +75,7 @@ class AblationConfig:
     out_json: Path = Path("ablation_results.json")
 
     max_examples: Optional[int] = None
-    max_new_tokens: int = 32      # lowered from 64 — repetition penalty + early stop keep gens short
+    max_new_tokens: int = 16      # tight cap — repetition penalty + early stop usually emit EOS sooner
     timing_warmup: int = 5
     timing_iters: int = 20
 
@@ -385,6 +385,7 @@ def main(cfg: AblationConfig) -> None:
                                 min_length=1,
                                 output_scores=True,
                                 return_dict_in_generate=True,
+                                early_stopping=True,
                             )
                         first_logits = out.scores[0][0]
                         yes_idx = vlm.string2idx["Yes"]

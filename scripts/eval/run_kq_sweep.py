@@ -91,7 +91,7 @@ class KQSweepConfig:
 
     max_examples: Optional[int] = None         # cap heldout examples per cell (for smoke tests)
     pope_max_examples: Optional[int] = 300     # cap POPE per cell — full ~3000 makes the sweep too slow
-    max_new_tokens: int = 32                   # capped to suppress runaway repetition
+    max_new_tokens: int = 16                   # tight cap — anti-repetition + early stop emit EOS usually sooner
     timing_warmup: int = 5
     timing_iters: int = 20
 
@@ -343,6 +343,7 @@ def main(cfg: KQSweepConfig) -> None:
                                     min_length=1,
                                     output_scores=True,
                                     return_dict_in_generate=True,
+                                    early_stopping=True,
                                 )
                             first_logits = out.scores[0][0]
                             yes_idx = vlm.string2idx["Yes"]
