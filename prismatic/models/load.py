@@ -98,12 +98,20 @@ def load(
 
     # Load VLM using `from_pretrained` (clobbers HF syntax... eventually should reconcile)
     overwatch.info(f"Loading VLM [bold blue]{model_cfg['model_id']}[/] from Checkpoint; Freezing Weights 🥶")
+    selector_kwargs = None
+    if model_cfg.get("arch_specifier", "").endswith("selector"):
+        selector_kwargs = {
+            "num_heads": model_cfg.get("selector_num_heads", 12),
+            "num_compressed_tokens": model_cfg.get("selector_num_compressed_tokens", 32),
+            "inference_k": model_cfg.get("selector_inference_k", 128),
+        }
     vlm = PrismaticVLM.from_pretrained(
         checkpoint_pt,
         model_cfg["model_id"],
         vision_backbone,
         llm_backbone,
         arch_specifier=model_cfg["arch_specifier"],
+        selector_kwargs=selector_kwargs,
     )
 
     return vlm

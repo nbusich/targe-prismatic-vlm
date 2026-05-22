@@ -98,6 +98,16 @@ class SelectorCompressorPipeline(nn.Module):
         self.inference_k = 128
         self.latest_keep_probs = None
 
+        # === Ablation routing (eval-time only) ===
+        # route_mode in {"selector", "full", "random_topk", "oracle"}
+        # use_qformer toggles the compress_mha path
+        # _oracle_indices: optional LongTensor (B, k) set by the eval harness per batch
+        # latest_selected_indices: LongTensor (B, k) saved on the "selector" path for IoU
+        self.route_mode = "selector"
+        self.use_qformer = True
+        self._oracle_indices = None
+        self.latest_selected_indices = None
+
     def forward(self, x):
         """
         Automatically routes to the correct logic based on model.train() or model.eval()
@@ -105,7 +115,23 @@ class SelectorCompressorPipeline(nn.Module):
         if self.training:
             return self._forward_train(x)
         else:
-            return self._forward_inference(x, k=self.inference_k)
+            return self._forward_inference(
+                x,
+                k=self.inference_k,
+                route_mode=self.route_mode,
+                use_qformer=self.use_qformer,
+                oracle_indices=self._oracle_indices,
+            )
+
+    @staticmethod
+    def _gather_split(x, sorted_idx, k):
+        """Split x along seq dim into (kept = first k rows of sorted_idx, dropped = rest)."""
+        B, N, D = x.shape
+        kept_raw = sorted_idx[:, :k]
+        dropped_raw = sorted_idx[:, k:]
+        kept = torch.gather(x, dim=1, index=kept_raw.unsqueeze(-1).expand(-1, -1, D))
+        dropped = torch.gather(x, dim=1, index=dropped_raw.unsqueeze(-1).expand(-1, -1, D))
+        return kept, dropped, kept_raw
 
     def _forward_train(self, x):
         # 0: Project vit dim to llm dim
@@ -154,58 +180,86 @@ class SelectorCompressorPipeline(nn.Module):
 
 
     @torch.no_grad()
-    def _forward_inference(self, x, k=128): # Replaced threshold with k
+    def _forward_inference(
+        self,
+        x,
+        k=128,
+        route_mode="selector",
+        use_qformer=True,
+        oracle_indices=None,
+    ):
         """
-        Uses Top-K selection to physically drop tokens.
-        Supports Batched Inference (B >= 1) because K is uniform across the batch!
-        """
-        # 0: Project vit to LLM dim
-        x = self.vit2llm(x)
+        Inference path with ablation routing. Always runs `vit2llm` then `connector`;
+        the middle (which tokens are kept vs. compressed) depends on `route_mode`
+        and `use_qformer`.
 
+        route_mode:
+          - "selector":    Trained Gumbel selector picks top-k.
+          - "full":        Keep all N tokens (no selection).
+          - "random_topk": Randomly pick k tokens.
+          - "oracle":      Use externally provided `oracle_indices` (B, k).
+
+        use_qformer:
+          If True, dropped tokens go through `compress_mha` against learned queries
+          and the M compressed tokens are concatenated to the kept tokens.
+          If False, only kept tokens are forwarded.
+        """
+        x = self.vit2llm(x)
         B, N, D = x.shape
 
-        # Safety catch: If the image is smaller than K, just keep everything
-        actual_k = min(k, N)
-
-        # 1. Get raw probabilities (bypass Gumbel noise)
-        logits = self.selector.router(x)
-        keep_probs = F.softmax(logits, dim=-1)[:, :, 0] # (B, N)
-        
-        # 2. Sort the tokens by their probability of being kept
-        # sorted_indices shape: (B, N)
-        _, sorted_indices = torch.sort(keep_probs, dim=1, descending=True)
-        
-        # 3. Split indices into Keep and Compress buckets
-        keep_idx_raw = sorted_indices[:, :actual_k]      # (B, actual_k)
-        compress_idx_raw = sorted_indices[:, actual_k:]  # (B, N - actual_k)
-
-        # 4. Expand indices to match the embedding dimension D for gathering
-        keep_idx = keep_idx_raw.unsqueeze(-1).expand(-1, -1, D)         # (B, actual_k, D)
-        compress_idx = compress_idx_raw.unsqueeze(-1).expand(-1, -1, D) # (B, N - actual_k, D)
-
-        # 5. PHYSICAL EXTRACTION (Sequence length dynamically shrinks here)
-        bypassed_tokens = torch.gather(x, dim=1, index=keep_idx)        # (B, actual_k, D)
-        tokens_to_compress = torch.gather(x, dim=1, index=compress_idx) # (B, N - actual_k, D)
-
-        # 6. COMPRESSION PATH (Physical)
-        queries = self.compress_queries.expand(B, -1, -1)
-        
-        # Only run cross-attention if there are actually tokens left to compress
-        if tokens_to_compress.size(1) > 0:
-            compressed_tokens, _ = self.compress_mha(
-                query=queries, 
-                key=tokens_to_compress, 
-                value=tokens_to_compress
-            ) # (B, M, D)
-        else:
-            # If all tokens were kept, compressor outputs zeros to maintain shape
-            compressed_tokens = torch.zeros(B, self.num_compressed_tokens, D, device=x.device)
-
-        # 7. RECOMBINE FOR CONNECTOR
-        combined_sequence = torch.cat([bypassed_tokens, compressed_tokens], dim=1) # (B, actual_k + M, D)
-
-        # 8. Execute downstream connector
-        final_output = self.connector(combined_sequence)
         self.latest_keep_probs = None
-        
-        return final_output
+        self.latest_selected_indices = None
+
+        # ---- Determine kept / dropped token splits ----
+        if route_mode == "full":
+            kept = x
+            dropped = x.new_zeros(B, 0, D)
+
+        elif route_mode == "random_topk":
+            actual_k = min(k, N)
+            perm = torch.stack(
+                [torch.randperm(N, device=x.device) for _ in range(B)], dim=0
+            )  # (B, N)
+            kept, dropped, _ = self._gather_split(x, perm, actual_k)
+
+        elif route_mode == "oracle":
+            assert oracle_indices is not None, "`oracle` route_mode requires `oracle_indices`"
+            assert oracle_indices.dim() == 2 and oracle_indices.size(0) == B, (
+                f"oracle_indices must be (B, k); got {tuple(oracle_indices.shape)}"
+            )
+            oi = oracle_indices.to(x.device, dtype=torch.long)
+            actual_k = oi.size(1)
+            # Build the complement so we can optionally feed it to the Q-Former.
+            mask = torch.ones(B, N, dtype=torch.bool, device=x.device)
+            mask.scatter_(1, oi, False)
+            complement = torch.stack([mask[b].nonzero(as_tuple=False).squeeze(-1) for b in range(B)], dim=0)
+            sorted_idx = torch.cat([oi, complement], dim=1)
+            kept, dropped, _ = self._gather_split(x, sorted_idx, actual_k)
+
+        elif route_mode == "selector":
+            actual_k = min(k, N)
+            logits = self.selector.router(x)
+            keep_probs = F.softmax(logits, dim=-1)[:, :, 0]
+            _, sorted_idx = torch.sort(keep_probs, dim=1, descending=True)
+            kept, dropped, kept_raw = self._gather_split(x, sorted_idx, actual_k)
+            self.latest_selected_indices = kept_raw
+
+        else:
+            raise ValueError(f"Unknown route_mode `{route_mode}`")
+
+        # ---- Optional Q-Former compression of dropped tokens ----
+        if use_qformer:
+            queries = self.compress_queries.expand(B, -1, -1)
+            if dropped.size(1) > 0:
+                compressed, _ = self.compress_mha(
+                    query=queries, key=dropped, value=dropped
+                )
+            else:
+                compressed = torch.zeros(
+                    B, self.num_compressed_tokens, D, device=x.device, dtype=x.dtype
+                )
+            combined = torch.cat([kept, compressed], dim=1)
+        else:
+            combined = kept
+
+        return self.connector(combined)
