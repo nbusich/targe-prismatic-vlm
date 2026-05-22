@@ -85,6 +85,12 @@ class AlignDataset(Dataset[Dict[str, torch.Tensor]]):
                 image_path = Path(example["image"])
                 conversation = example["conversations"]
 
+                # Some chat.json variants store `conversations` as a JSON-encoded *string*
+                # instead of an actual list. Decode here so downstream consumers see the
+                # canonical shape (`list[dict]`).
+                if isinstance(conversation, str):
+                    conversation = json.loads(conversation)
+
                 # Structural validation: align-stage expects exactly (human, gpt) with each
                 # turn a dict containing a string `value` and `<image>` only in the human turn.
                 # Anything else (string elements, missing keys, wrong turn count, image in gpt)
@@ -139,7 +145,16 @@ class AlignDataset(Dataset[Dict[str, torch.Tensor]]):
         modality_lengths = []
         for example in self.examples:
             is_multimodal = "image" in example
-            n_words = sum([len(turn["value"].replace("<image>", "").split()) for turn in example["conversations"]])
+            conv = example.get("conversations", [])
+            if isinstance(conv, str):
+                try:
+                    conv = json.loads(conv)
+                except (ValueError, TypeError):
+                    conv = []
+            n_words = 0
+            for turn in conv if isinstance(conv, list) else []:
+                if isinstance(turn, dict) and isinstance(turn.get("value"), str):
+                    n_words += len(turn["value"].replace("<image>", "").split())
             modality_lengths.append((is_multimodal, (n_image_patches + n_words) if is_multimodal else n_words))
         return modality_lengths
 
@@ -185,6 +200,11 @@ class FinetuneDataset(Dataset[Dict[str, torch.Tensor]]):
             try:
                 example = self.examples[idx]
                 conversation = example["conversations"]
+
+                # Decode JSON-string `conversations` if present (some variants store the
+                # turn list as an encoded string instead of a list).
+                if isinstance(conversation, str):
+                    conversation = json.loads(conversation)
 
                 # Structural validation: each turn must be a dict with string `from`+`value`.
                 if not isinstance(conversation, list) or len(conversation) < 2 or not all(
@@ -256,7 +276,16 @@ class FinetuneDataset(Dataset[Dict[str, torch.Tensor]]):
         modality_lengths = []
         for example in self.examples:
             is_multimodal = "image" in example
-            n_words = sum([len(turn["value"].split()) for turn in example["conversations"]])
+            conv = example.get("conversations", [])
+            if isinstance(conv, str):
+                try:
+                    conv = json.loads(conv)
+                except (ValueError, TypeError):
+                    conv = []
+            n_words = 0
+            for turn in conv if isinstance(conv, list) else []:
+                if isinstance(turn, dict) and isinstance(turn.get("value"), str):
+                    n_words += len(turn["value"].split())
             modality_lengths.append((is_multimodal, n_words))
         return modality_lengths
 
