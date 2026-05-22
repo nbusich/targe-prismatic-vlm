@@ -24,6 +24,7 @@ Run:
 
 import json
 import os
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
@@ -186,6 +187,7 @@ def main(cfg: OracleConfig) -> None:
 
     oracle: dict = {}
     skipped = 0
+    first_traceback_printed = False
     for ex in tqdm(heldout, desc="oracle"):
         ex_id = ex.get("id") or ex.get("image")
         img_rel = ex.get("image")
@@ -211,6 +213,14 @@ def main(cfg: OracleConfig) -> None:
         try:
             idx = _extract_oracle_indices(vlm, image, human, gpt, cfg.early_layers, top_k)
         except Exception as e:
+            if not first_traceback_printed:
+                print(
+                    f"\n[oracle] FIRST FAILURE on ex={ex_id} — full traceback follows "
+                    "(subsequent failures will be one-liners):\n",
+                    flush=True,
+                )
+                traceback.print_exc()
+                first_traceback_printed = True
             overwatch.info(f"[skip] {ex_id}: {type(e).__name__}: {e}")
             skipped += 1
             continue

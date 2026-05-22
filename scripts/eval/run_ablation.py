@@ -33,6 +33,7 @@ Run:
 import json
 import os
 import time
+import traceback
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -264,6 +265,18 @@ def main(cfg: AblationConfig) -> None:
     pope_metrics: Dict[str, dict] = {}
     hw_metrics: Dict[str, dict] = {}
 
+    # Print the first failure (across all swallowers) in full, then go quiet on tracebacks.
+    first_traceback_printed = {"flag": False}
+    def _maybe_print_first_traceback(stage: str, ex_id: str) -> None:
+        if not first_traceback_printed["flag"]:
+            print(
+                f"\n[ablation] FIRST FAILURE during `{stage}` on ex={ex_id} — full traceback follows "
+                "(subsequent failures will be one-liners):\n",
+                flush=True,
+            )
+            traceback.print_exc()
+            first_traceback_printed["flag"] = True
+
     for ex in tqdm(heldout, desc="ablation"):
         ex_id = str(ex.get("id") or ex.get("image"))
         try:
@@ -287,9 +300,11 @@ def main(cfg: AblationConfig) -> None:
                 _set_route(vlm.projector, "full", False, None)
                 ref_latent = _capture_connector_output(vlm, pixel_values).float().flatten(1)
             except Exception as e:
+                _maybe_print_first_traceback("ref-latent", ex_id)
                 overwatch.info(f"[ex={ex_id}] ref-latent failed, skipping example: {type(e).__name__}: {e}")
                 continue
         except Exception as e:
+            _maybe_print_first_traceback("setup", ex_id)
             overwatch.info(f"[ex={ex_id}] setup failed: {type(e).__name__}: {e}")
             continue
 
@@ -316,6 +331,7 @@ def main(cfg: AblationConfig) -> None:
                 gen = _generate_text(vlm, input_ids, pixel_values, cfg.max_new_tokens)
                 results[name]["generations"].append({"id": ex_id, "prompt": human, "gen": gen})
             except Exception as e:
+                _maybe_print_first_traceback(f"group-{name}", ex_id)
                 results[name]["n_errors"] += 1
                 results[name]["generations"].append(
                     {"id": ex_id, "prompt": human, "gen": f"<error: {type(e).__name__}: {e}>"}
