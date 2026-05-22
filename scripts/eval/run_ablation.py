@@ -136,11 +136,14 @@ def _prep_inputs(vlm, image: Image.Image, human: str):
     prompt_text = prompt_builder.get_prompt()
     input_ids = tokenizer(prompt_text, truncation=True, return_tensors="pt").input_ids.to(device)
 
+    # The VLM is fully cast to bf16 upstream; `_capture_connector_output` runs without
+    # autocast, so pixel_values must already match the model dtype.
+    model_dtype = next(vlm.vision_backbone.parameters()).dtype
     pixel_values = image_transform(image)
     if isinstance(pixel_values, torch.Tensor):
-        pixel_values = pixel_values[None, ...].to(device)
+        pixel_values = pixel_values[None, ...].to(device=device, dtype=model_dtype)
     elif isinstance(pixel_values, dict):
-        pixel_values = {k: v[None, ...].to(device) for k, v in pixel_values.items()}
+        pixel_values = {k: v[None, ...].to(device=device, dtype=model_dtype) for k, v in pixel_values.items()}
     else:
         raise ValueError(f"Unsupported pixel_values type: {type(pixel_values)}")
 
