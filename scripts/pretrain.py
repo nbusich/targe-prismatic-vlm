@@ -23,6 +23,13 @@ Run with:
 
 import json
 import os
+
+# Purge empty/whitespace HF token env vars BEFORE huggingface_hub is imported so it doesn't
+# build an "Authorization: Bearer " header and crash httpx with LocalProtocolError.
+for _v in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+    if not os.environ.get(_v, "").strip():
+        os.environ.pop(_v, None)
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple, Union
@@ -140,7 +147,12 @@ def pretrain(cfg: PretrainConfig) -> None:
 
     # Start =>> Build Directories and Set Randomness
     overwatch.info('"Life is like a prism; what you see depends on how you turn the glass."', ctx_level=1)
-    hf_token = cfg.hf_token.read_text().strip() if isinstance(cfg.hf_token, Path) else os.environ[cfg.hf_token]
+    if isinstance(cfg.hf_token, Path):
+        hf_token = cfg.hf_token.read_text().strip() if cfg.hf_token.exists() else ""
+    else:
+        hf_token = os.environ.get(cfg.hf_token, "").strip()
+    if not hf_token:
+        hf_token = None  # anonymous request — avoid `Authorization: Bearer ""` httpx crash
     worker_init_fn = set_global_seed(cfg.seed, get_worker_init_fn=True)
     os.makedirs(run_dir := (cfg.run_root_dir / cfg.run_id), exist_ok=True)
     os.makedirs(cfg.run_root_dir / cfg.run_id / "checkpoints", exist_ok=True)

@@ -110,6 +110,23 @@ class LLaVa_LVIS4V_LRV_Config(DatasetConfig):
     dataset_root_dir: Path = Path("/mnt/fsx/skaramcheti/datasets/prismatic-vlms")
 
 
+# Local 5k subset untarred to `/content/train_subset_5k/` on the Colab VM
+@dataclass
+class TARGE_Subset_5K_Config(DatasetConfig):
+    dataset_id: str = "targe-subset-5k"
+
+    align_stage_components: Tuple[Path, Path] = (
+        Path("train_subset_5k/chat_subset_5k.json"),
+        Path("train_subset_5k/"),
+    )
+    # No separate finetune split — point at same files so finetune-stage code paths don't blow up.
+    finetune_stage_components: Tuple[Path, Path] = (
+        Path("train_subset_5k/chat_subset_5k.json"),
+        Path("train_subset_5k/"),
+    )
+    dataset_root_dir: Path = Path("/content")
+
+
 # === Define a Dataset Registry Enum for Reference & Validation =>> all *new* datasets must be added here! ===
 @unique
 class DatasetRegistry(Enum):
@@ -122,6 +139,8 @@ class DatasetRegistry(Enum):
     LLAVA_LRV = LLaVa_LRV_Config
 
     LLAVA_LVIS4V_LRV = LLaVa_LVIS4V_LRV_Config
+
+    TARGE_SUBSET_5K = TARGE_Subset_5K_Config
 
     @property
     def dataset_id(self) -> str:
