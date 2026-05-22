@@ -56,7 +56,10 @@ GROUPS: List[Tuple[str, dict]] = [
     ("C", {"route_mode": "oracle",      "use_qformer": False}),
     ("D", {"route_mode": "selector",    "use_qformer": True }),
     ("E", {"route_mode": "selector",    "use_qformer": False}),
-    ("F", {"route_mode": "full",        "use_qformer": True }),
+    # Group F (route_mode="full", use_qformer=True) was removed: in `_forward_inference`
+    # the `dropped` tensor is empty when route_mode="full", so the Q-Former operates on
+    # zero tokens and returns zeros, making F's connector output identical to A's padded
+    # with zeros (cos_vs_A ≈ 0.9996). It is not a meaningful ablation as currently coded.
 ]
 
 

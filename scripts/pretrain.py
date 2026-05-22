@@ -86,6 +86,11 @@ class PretrainConfig:
     selector_lambda_warmup_ratio: float = 0.1                       # fraction of total steps before sparsity penalty kicks in
     selector_target_keep_ratio: float = 0.5                         # two-sided target for mean keep prob
 
+    # DataLoader Parameters
+    # `num_workers=None` → auto-scale to min(8, cpu_count). Set explicitly to override.
+    num_workers: Optional[int] = None
+    pin_memory: bool = True
+
     # HF Hub Credentials (for any gated models)
     hf_token: Union[str, Path] = Path(".hf_token")                  # Environment variable or Path to HF Token
 
@@ -235,6 +240,8 @@ def pretrain(cfg: PretrainConfig) -> None:
         selector_lambda_target=cfg.selector_lambda_target,
         selector_lambda_warmup_ratio=cfg.selector_lambda_warmup_ratio,
         selector_target_keep_ratio=cfg.selector_target_keep_ratio,
+        num_workers=cfg.num_workers,
+        pin_memory=cfg.pin_memory,
     )
     train_strategy.run_setup(run_dir=run_dir, n_train_examples=len(train_dataset))
 

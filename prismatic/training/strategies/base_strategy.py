@@ -57,6 +57,8 @@ class TrainingStrategy(ABC):
         selector_lambda_warmup_ratio: float = 0.1,
         selector_target_keep_ratio: float = 0.5,
         worker_init_fn: Optional[Callable[[int], None]] = None,
+        num_workers: Optional[int] = None,
+        pin_memory: bool = True,
         **_: str,
     ) -> None:
         self.vlm, self.device_id = vlm, device_id
@@ -80,9 +82,17 @@ class TrainingStrategy(ABC):
 
         # DataLoader Parameters
         self.worker_init_fn = worker_init_fn
+        # Auto-scale num_workers to min(8, cpu_count) — Colab usually has 2-12 vCPUs.
+        # Cap at 8 so we don't trigger oversubscription on big boxes.
+        import os as _os
+        self.num_workers = int(num_workers) if num_workers is not None else min(8, _os.cpu_count() or 2)
+        self.pin_memory = pin_memory
 
         # Optimizers & Scheduler (initialized in `run_setup`)
         self.optimizer, self.lr_scheduler = None, None
+
+        # First-backward gradient audit (one-shot; verifies the selector/Q-Former graph isn't severed)
+        self._grad_audit_done = False
 
         # Selector schedule parameters
         self.selector_tau_start = selector_tau_start
@@ -152,13 +162,20 @@ class TrainingStrategy(ABC):
             )
 
         # Create a DataLoader with the initialized sampler, per-device-bsz, and collator
+        overwatch.info(
+            f"DataLoader: num_workers={self.num_workers}  pin_memory={self.pin_memory}  "
+            f"persistent_workers={self.num_workers > 0}"
+        )
         dataloader = DataLoader(
             dataset,
             batch_size=self.per_device_batch_size,
             sampler=sampler,
             collate_fn=collator,
-            num_workers=2,
+            num_workers=self.num_workers,
             worker_init_fn=self.worker_init_fn,
+            pin_memory=self.pin_memory,
+            persistent_workers=self.num_workers > 0,
+            prefetch_factor=2 if self.num_workers > 0 else None,
         )
 
         # Max Steps vs. Epochs Computation
@@ -278,6 +295,35 @@ class TrainingStrategy(ABC):
                     #   someone to PR and fix this (and I'd greatly appreciate it!!!)
                     normalized_loss = loss / self.grad_accumulation_steps
                     normalized_loss.backward()
+
+                    # One-shot gradient audit on the first backward. Surfaces top-k / detach
+                    # bugs that silently sever the selector graph: if `selector.router.weight`
+                    # gets a None/zero grad, Gumbel straight-through plumbing is broken.
+                    if not self._grad_audit_done and overwatch.is_rank_zero():
+                        self._grad_audit_done = True
+                        projector = (
+                            self.vlm.module.projector if hasattr(self.vlm, "module") else self.vlm.projector
+                        )
+                        print("=== first-backward gradient audit (projector) ===", flush=True)
+                        any_zero = False
+                        for _name, _p in projector.named_parameters():
+                            if not _p.requires_grad:
+                                continue
+                            if _p.grad is None:
+                                print(f"  [WARN] {_name}: grad is None", flush=True)
+                                any_zero = True
+                                continue
+                            _n = _p.grad.detach().float().norm().item()
+                            _tag = "  [ZERO]" if _n == 0.0 else ""
+                            print(f"  {_name:60s}  ||grad|| = {_n:.4e}{_tag}", flush=True)
+                            if _n == 0.0:
+                                any_zero = True
+                        if any_zero:
+                            print(
+                                "[WARN] one or more projector params received zero/None grad. "
+                                "Top-k / detach may be severing the graph.",
+                                flush=True,
+                            )
 
                     # Step =>> Only if Done w/ Gradient Accumulation
                     if (train_idx + 1) % self.grad_accumulation_steps == 0:
