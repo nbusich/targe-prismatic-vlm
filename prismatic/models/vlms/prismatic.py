@@ -44,6 +44,12 @@ IGNORE_INDEX = -100
 
 
 class PrismaticVLM(VLM):
+    # transformers >=4.45 inspects this on the class during `generate()` (the
+    # `super().generate(...)` indirection in run_ablation / run_kq_sweep fails with
+    # `AttributeError: type object ... has no attribute '_is_stateful'` if we don't
+    # declare it). PrismaticVLM is not a stateful (recurrent) model.
+    _is_stateful = False
+
     def __init__(
         self,
         model_id: str,
