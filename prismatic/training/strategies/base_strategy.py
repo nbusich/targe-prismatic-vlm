@@ -306,19 +306,32 @@ class TrainingStrategy(ABC):
                         )
                         print("=== first-backward gradient audit (projector) ===", flush=True)
                         any_zero = False
+                        n_inspected = 0
                         for _name, _p in projector.named_parameters():
                             if not _p.requires_grad:
                                 continue
+                            n_inspected += 1
                             if _p.grad is None:
                                 print(f"  [WARN] {_name}: grad is None", flush=True)
                                 any_zero = True
                                 continue
-                            _n = _p.grad.detach().float().norm().item()
+                            try:
+                                _n = _p.grad.detach().float().norm().item()
+                            except Exception as _e:
+                                print(f"  [WARN] {_name}: could not compute norm ({type(_e).__name__}: {_e})", flush=True)
+                                any_zero = True
+                                continue
                             _tag = "  [ZERO]" if _n == 0.0 else ""
                             print(f"  {_name:60s}  ||grad|| = {_n:.4e}{_tag}", flush=True)
                             if _n == 0.0:
                                 any_zero = True
-                        if any_zero:
+                        if n_inspected == 0:
+                            print(
+                                "[WARN] projector has zero trainable params — `freeze_backbones` "
+                                "may have frozen everything by mistake.",
+                                flush=True,
+                            )
+                        elif any_zero:
                             print(
                                 "[WARN] one or more projector params received zero/None grad. "
                                 "Top-k / detach may be severing the graph.",

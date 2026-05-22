@@ -50,8 +50,10 @@ def worker_init_function(worker_id: int) -> None:
 
     :param worker_id: Identifier for the given worker [0, num_workers) for the Dataloader in question.
     """
-    # Get current `rank` (if running distributed) and `process_seed`
-    global_rank, process_seed = int(os.environ["LOCAL_RANK"]), torch.initial_seed()
+    # Get current `rank` (if running distributed) and `process_seed`. `LOCAL_RANK` is set by
+    # torchrun; fall back to 0 so direct `python scripts/pretrain.py` invocations don't crash
+    # the dataloader workers with KeyError.
+    global_rank, process_seed = int(os.environ.get("LOCAL_RANK", "0")), torch.initial_seed()
 
     # Back out the "base" (original) seed - the per-worker seed is set in PyTorch:
     #   > https://pytorch.org/docs/stable/data.html#data-loading-randomness

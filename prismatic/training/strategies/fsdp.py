@@ -61,8 +61,12 @@ class FSDPStrategy(TrainingStrategy):
         state_dict_type: StateDictType = StateDictType.FULL_STATE_DICT,
         selector_tau_start: float = 1.0,
         selector_tau_end: float = 0.1,
+        selector_tau_hold_ratio: float = 0.2,
         selector_lambda_target: float = 0.05,
         selector_lambda_warmup_ratio: float = 0.1,
+        selector_target_keep_ratio: float = 0.5,
+        num_workers: Optional[int] = None,
+        pin_memory: bool = True,
     ) -> None:
         super().__init__(
             vlm=vlm,
@@ -83,8 +87,12 @@ class FSDPStrategy(TrainingStrategy):
             worker_init_fn=worker_init_fn,
             selector_tau_start=selector_tau_start,
             selector_tau_end=selector_tau_end,
+            selector_tau_hold_ratio=selector_tau_hold_ratio,
             selector_lambda_target=selector_lambda_target,
             selector_lambda_warmup_ratio=selector_lambda_warmup_ratio,
+            selector_target_keep_ratio=selector_target_keep_ratio,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
         )
 
         # FSDP-Specific Parameters
