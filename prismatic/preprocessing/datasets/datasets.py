@@ -75,7 +75,15 @@ class AlignDataset(Dataset[Dict[str, torch.Tensor]]):
         :return: Dictionary of {"pixel_values": torch.Tensor, "input_ids": torch.Tensor, "labels": torch.Tensor}
         """
         image_path, conversation = Path(self.examples[idx]["image"]), self.examples[idx]["conversations"]
-        assert (len(conversation) == 2) and ("<image>" not in conversation[-1]["value"]), "Unexpected text!"
+        # Skip malformed entries instead of crashing the dataloader — same fallback pattern
+        # as bad images below. Align-stage expects exactly (human, gpt) and `<image>` only in
+        # the human turn; anything else can't be consumed by the prompt template.
+        if len(conversation) != 2 or "<image>" in conversation[-1].get("value", ""):
+            overwatch.warning(
+                f"[AlignDataset] Skipping malformed conversation idx={idx} "
+                f"(n_turns={len(conversation)}, image_in_gpt={'<image>' in conversation[-1].get('value', '')})"
+            )
+            return self.__getitem__((idx + 1) % len(self.examples))
 
         # Format Caption --> {caption}{eos_token}
         caption = self.prompt_template.format(caption=conversation[-1]["value"].strip())
