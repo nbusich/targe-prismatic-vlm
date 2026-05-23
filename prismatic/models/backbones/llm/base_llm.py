@@ -105,6 +105,7 @@ class HFCausalLLMBackbone(LLMBackbone, ABC):
         hf_token: Optional[str] = None,
         inference_mode: bool = False,
         use_flash_attention_2: bool = False,
+        from_pretrained_kwargs: Optional[dict] = None,
     ) -> None:
         super().__init__(llm_backbone_id)
         self.llm_family = llm_family
@@ -126,6 +127,7 @@ class HFCausalLLMBackbone(LLMBackbone, ABC):
                 hf_hub_path,
                 token=hf_token,
                 attn_implementation=attn_impl,
+                **(from_pretrained_kwargs or {}),
             )
 
         # [Contract] `inference_mode` means we're loading from a pretrained checkpoint; no need to load base weights!

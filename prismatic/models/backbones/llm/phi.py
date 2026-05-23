@@ -8,7 +8,7 @@ from typing import Optional, Type
 
 import torch
 from torch import nn as nn
-from transformers import PhiForCausalLM
+from transformers import AutoConfig, PhiForCausalLM
 from transformers.models.phi.modeling_phi import PhiDecoderLayer
 
 from prismatic.models.backbones.llm.base_llm import HFCausalLLMBackbone
@@ -34,12 +34,21 @@ class PhiLLMBackbone(HFCausalLLMBackbone):
         inference_mode: bool = False,
         use_flash_attention_2: bool = True,
     ) -> None:
+        # `microsoft/phi-2`'s saved config has no `pad_token_id` field; newer transformers
+        # (>=4.45) construct `PhiModel` by reading `config.pad_token_id` in __init__ and
+        # crash with AttributeError before we get to set it. Pre-load the config and force
+        # the attribute, then thread it through so `from_pretrained` uses our patched copy.
+        hf_hub_path = PHI_MODELS[llm_backbone_id]["hf_hub_path"]
+        patched_config = AutoConfig.from_pretrained(hf_hub_path, token=hf_token)
+        object.__setattr__(patched_config, "pad_token_id", None)
+
         super().__init__(
             llm_backbone_id,
             llm_max_length=llm_max_length,
             hf_token=hf_token,
             inference_mode=inference_mode,
             use_flash_attention_2=use_flash_attention_2,
+            from_pretrained_kwargs={"config": patched_config},
             **PHI_MODELS[llm_backbone_id],
         )
 

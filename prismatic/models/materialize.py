@@ -69,7 +69,7 @@ LLM_BACKBONES = {
     "mistral-v0.1-7b-instruct": {"cls": MistralLLMBackbone, "kwargs": {}},
 
     # === Phi-2 Backbone ===
-    "phi-2-3b": {"cls": PhiLLMBackbone, "kwargs": {}},
+    "phi-2-3b": {"cls": PhiLLMBackbone, "kwargs": {"use_flash_attention_2": False}},
 
     # === SmolLM2 (Llama-architecture; routed through LLaMa2LLMBackbone) ===
     # flash-attn-2 disabled: required for free-tier Colab T4 (Turing, sm_75) which doesn't
