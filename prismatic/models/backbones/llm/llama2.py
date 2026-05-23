@@ -16,14 +16,12 @@ from prismatic.models.backbones.llm.prompting import (
     LLaMa2ChatPromptBuilder,
     PromptBuilder,
     PurePromptBuilder,
+    SmolLM2ChatPromptBuilder,
     VicunaV15ChatPromptBuilder,
 )
 from prismatic.overwatch import initialize_overwatch
 
 overwatch = initialize_overwatch(__name__)
-
-# One-shot guard so the SmolLM2 prompt-template warning fires once per process, not per example.
-_SMOLLM2_PROMPT_WARNED = False
 
 # Registry =>> Support LLaMa-2 Models (from HF Transformers)
 # fmt: off
@@ -104,19 +102,7 @@ class LLaMa2LLMBackbone(HFCausalLLMBackbone):
             return VicunaV15ChatPromptBuilder
 
         elif self.identifier.startswith("smollm2"):
-            # SmolLM2-Instruct was chat-tuned with an `<|im_start|>` template; PurePromptBuilder's
-            # `In:/Out:` format does NOT match that. Logged once per process so it stops spamming
-            # eval loops that build a new prompt every example.
-            global _SMOLLM2_PROMPT_WARNED
-            if not _SMOLLM2_PROMPT_WARNED:
-                _SMOLLM2_PROMPT_WARNED = True
-                overwatch.warning(
-                    f"[smollm2] Using PurePromptBuilder for `{self.identifier}` — this does NOT match "
-                    "SmolLM2-Instruct's chat template (`<|im_start|>` style). Expect degraded loss/accuracy "
-                    "vs. a proper chat-template prompter. OK for smoke tests; replace before reporting results. "
-                    "(this warning is suppressed on subsequent calls)"
-                )
-            return PurePromptBuilder
+            return SmolLM2ChatPromptBuilder
 
         raise ValueError(f"No PromptBuilder defined for LLM Backbone `{self.identifier}`")
 

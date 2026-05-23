@@ -17,7 +17,7 @@ from typing import Dict, List, Tuple, Type
 import torch
 from PIL import Image, ImageFile, UnidentifiedImageError
 from torch.utils.data import Dataset
-from transformers import CodeGenTokenizerFast, LlamaTokenizerFast, PreTrainedTokenizerBase
+from transformers import CodeGenTokenizerFast, GPT2TokenizerFast, LlamaTokenizerFast, PreTrainedTokenizerBase
 
 from prismatic.overwatch import initialize_overwatch
 from prismatic.models.backbones.llm.prompting import PromptBuilder
@@ -221,7 +221,8 @@ class FinetuneDataset(Dataset[Dict[str, torch.Tensor]]):
                     msg = prompt_builder.add_turn(turn["from"], turn["value"])
                     if isinstance(self.tokenizer, LlamaTokenizerFast):
                         msg = msg.rstrip()
-                    elif isinstance(self.tokenizer, CodeGenTokenizerFast):
+                    elif isinstance(self.tokenizer, (CodeGenTokenizerFast, GPT2TokenizerFast)):
+                        # SmolLM2's tokenizer is a GPT2TokenizerFast variant; no auto-BOS, no extra rstrip.
                         pass
                     else:
                         raise ValueError(f"Tokenizer of type `{type(self.tokenizer)}` is not explicitly handled!")
