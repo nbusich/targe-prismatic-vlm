@@ -243,6 +243,17 @@ class TrainingStrategy(ABC):
                         )
                         loss = output.loss
 
+                        # --- TARGE: two-sided sparsity penalty around `selector_target_keep_ratio` ---
+                        # Opt-in: only active when --selector_lambda_target > 0.
+                        keep_probs = getattr(projector_inner, "latest_keep_probs", None)
+                        if keep_probs is not None and self.selector_lambda_target > 0:
+                            total = self.max_steps if self.max_steps is not None else len(dataloader) * self.epochs
+                            warmup = int(self.selector_lambda_warmup_ratio * total)
+                            if metrics.global_step >= warmup:
+                                ramp = min(1.0, (metrics.global_step - warmup) / max(1, total - warmup))
+                                keep_gap = keep_probs.mean() - self.selector_target_keep_ratio
+                                loss = loss + self.selector_lambda_target * ramp * keep_gap.pow(2)
+
                     # --- NaN/Inf guard: diagnose blow-ups before they corrupt optimizer state ---
                     if not torch.isfinite(loss):
                         diag = {
