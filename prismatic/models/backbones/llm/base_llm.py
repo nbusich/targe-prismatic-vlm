@@ -133,7 +133,12 @@ class HFCausalLLMBackbone(LLMBackbone, ABC):
         # [Contract] `inference_mode` means we're loading from a pretrained checkpoint; no need to load base weights!
         else:
             overwatch.info(f"Building empty [bold]{llm_family}[/] LLM from [underline]`{hf_hub_path}`[/]", ctx_level=1)
-            llm_config = AutoConfig.from_pretrained(hf_hub_path, token=hf_token)
+            # Honor a patched `config` passed via `from_pretrained_kwargs` (e.g. PhiLLMBackbone
+            # forces `pad_token_id=None` because microsoft/phi-2's saved config omits it and
+            # transformers >=4.45 reads it in PhiModel.__init__). Otherwise load fresh from HF.
+            llm_config = (from_pretrained_kwargs or {}).get("config")
+            if llm_config is None:
+                llm_config = AutoConfig.from_pretrained(hf_hub_path, token=hf_token)
             self.llm = llm_cls._from_config(llm_config)
 
         # Lightweight Handling (with extended explanation) for setting some LLM Parameters
