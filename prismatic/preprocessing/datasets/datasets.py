@@ -17,7 +17,7 @@ from typing import Dict, List, Tuple, Type
 import torch
 from PIL import Image, ImageFile, UnidentifiedImageError
 from torch.utils.data import Dataset
-from transformers import CodeGenTokenizerFast, LlamaTokenizerFast, PreTrainedTokenizerBase
+from transformers import CodeGenTokenizerFast, GPT2TokenizerFast, LlamaTokenizerFast, PreTrainedTokenizerBase
 
 from prismatic.overwatch import initialize_overwatch
 from prismatic.models.backbones.llm.prompting import PromptBuilder
@@ -74,40 +74,87 @@ class AlignDataset(Dataset[Dict[str, torch.Tensor]]):
 
         :return: Dictionary of {"pixel_values": torch.Tensor, "input_ids": torch.Tensor, "labels": torch.Tensor}
         """
-        image_path, conversation = Path(self.examples[idx]["image"]), self.examples[idx]["conversations"]
-        assert (len(conversation) == 2) and ("<image>" not in conversation[-1]["value"]), "Unexpected text!"
+        # Bounded skip-and-retry loop — prevents worker stack overflow if many consecutive
+        # rows are malformed (recursion through __getitem__ would otherwise hit Python's
+        # recursion limit inside the dataloader worker).
+        MAX_TRIES = 32
+        n = len(self.examples)
+        for _ in range(MAX_TRIES):
+            try:
+                example = self.examples[idx]
+                image_path = Path(example["image"])
+                conversation = example["conversations"]
 
-        # Format Caption --> {caption}{eos_token}
-        caption = self.prompt_template.format(caption=conversation[-1]["value"].strip())
+                # Some chat.json variants store `conversations` as a JSON-encoded *string*
+                # instead of an actual list. Decode here so downstream consumers see the
+                # canonical shape (`list[dict]`).
+                if isinstance(conversation, str):
+                    conversation = json.loads(conversation)
 
-        # We treat image patches as "tokens = [p1 p2 p3, ...]"; we need to specify ordering of text/patch tokens.
-        #   => Critically, we find that inserting *after* the BOS token leads to the strongest performance!
-        #       - input_ids = "<s> p1 p2 p3 ... <caption_text> \n"
-        #       - labels = "IGNORE IGNORE ..." (copy `input_ids` replacing <s> and p{1...K} with IGNORE)
-        #
-        # IMPORTANT => IF WE'RE USING HF LLM.forward(... labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
-        input_ids = self.tokenizer(caption, truncation=True, return_tensors="pt").input_ids[0]
-        labels = copy.deepcopy(input_ids)
+                # Structural validation: align-stage expects exactly (human, gpt) with each
+                # turn a dict containing a string `value` and `<image>` only in the human turn.
+                # Anything else (string elements, missing keys, wrong turn count, image in gpt)
+                # is treated as malformed and skipped.
+                if (
+                    not isinstance(conversation, list)
+                    or len(conversation) != 2
+                    or not all(isinstance(t, dict) and isinstance(t.get("value"), str) for t in conversation)
+                    or "<image>" in conversation[-1]["value"]
+                ):
+                    overwatch.warning(f"[AlignDataset] Skipping malformed conversation idx={idx}")
+                    idx = (idx + 1) % n
+                    continue
 
-        # Set the <BOS> token's label to IGNORE_INDEX (since we're inserting the image patches right after)
-        labels[0] = IGNORE_INDEX
+                # Format Caption --> {caption}{eos_token}
+                caption = self.prompt_template.format(caption=conversation[-1]["value"].strip())
 
-        # Process Image --> get "pixel_values" (will either be a torch.Tensor OR a Dict[str,torch.Tensor])
-        # Fall back to the next example if this image is corrupt/missing rather than crashing the dataloader.
-        try:
-            pixel_values = self.image_transform(Image.open(self.image_dir / image_path).convert("RGB"))
-        except _BAD_IMAGE_ERRORS as ex:
-            overwatch.warning(f"[AlignDataset] Skipping bad image idx={idx} path={image_path} ({type(ex).__name__}: {ex})")
-            return self.__getitem__((idx + 1) % len(self.examples))
+                # input_ids = "<s> p1 p2 p3 ... <caption_text> \n"; labels copy with <BOS> -> IGNORE.
+                # Shifting happens INSIDE HF LLM.forward() when labels= is passed.
+                input_ids = self.tokenizer(caption, truncation=True, return_tensors="pt").input_ids[0]
+                labels = copy.deepcopy(input_ids)
+                labels[0] = IGNORE_INDEX
 
-        return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
+                # Process Image — fall back to the next example if corrupt/missing.
+                try:
+                    pixel_values = self.image_transform(Image.open(self.image_dir / image_path).convert("RGB"))
+                except _BAD_IMAGE_ERRORS as ex:
+                    overwatch.warning(
+                        f"[AlignDataset] Skipping bad image idx={idx} path={image_path} "
+                        f"({type(ex).__name__}: {ex})"
+                    )
+                    idx = (idx + 1) % n
+                    continue
+
+                return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
+
+            except (KeyError, TypeError, AttributeError, IndexError, ValueError) as ex:
+                # Catch any other structural defect — e.g. missing keys, wrong types.
+                overwatch.warning(
+                    f"[AlignDataset] Skipping idx={idx} due to {type(ex).__name__}: {ex}"
+                )
+                idx = (idx + 1) % n
+                continue
+
+        raise RuntimeError(
+            f"[AlignDataset] no usable example after {MAX_TRIES} tries starting at idx={idx}. "
+            "Dataset is likely badly corrupted or paths are wrong."
+        )
 
     def get_modality_lengths(self, n_image_patches: int) -> List[Tuple[bool, int]]:
         """Get a list of modalities (unimodal / text-only vs. multimodal) and length of conversations per example."""
         modality_lengths = []
         for example in self.examples:
             is_multimodal = "image" in example
-            n_words = sum([len(turn["value"].replace("<image>", "").split()) for turn in example["conversations"]])
+            conv = example.get("conversations", [])
+            if isinstance(conv, str):
+                try:
+                    conv = json.loads(conv)
+                except (ValueError, TypeError):
+                    conv = []
+            n_words = 0
+            for turn in conv if isinstance(conv, list) else []:
+                if isinstance(turn, dict) and isinstance(turn.get("value"), str):
+                    n_words += len(turn["value"].replace("<image>", "").split())
             modality_lengths.append((is_multimodal, (n_image_patches + n_words) if is_multimodal else n_words))
         return modality_lengths
 
@@ -147,71 +194,99 @@ class FinetuneDataset(Dataset[Dict[str, torch.Tensor]]):
 
         :return: Dictionary of {"pixel_values": torch.Tensor, "input_ids": torch.Tensor, "labels": torch.Tensor}
         """
-        conversation = self.examples[idx]["conversations"]
-
-        # Create Prompt Builder --> add each message sequentially
-        prompt_builder, input_ids, labels = self.prompt_builder_fn(model_family="prismatic"), [], []
-        for turn_idx, turn in enumerate(conversation):
-            # Get "effective" string added to prompt --> handle whitespace for tokenizer type!
-            msg = prompt_builder.add_turn(turn["from"], turn["value"])
-
-            # Llama Tokenizer (Fast) adds extra character if a string ends in whitespace --> strip if non-empty!
-            if isinstance(self.tokenizer, LlamaTokenizerFast):
-                msg = msg.rstrip()
-
-            # Phi-2 Tokenizer == CodeGenTokenizer (Fast) -- no special handling!
-            elif isinstance(self.tokenizer, CodeGenTokenizerFast):
-                pass
-
-            else:
-                raise ValueError(f"Tokenizer of type `{type(self.tokenizer)}` is not explicitly handled!")
-
-            # Tokenize Input IDs
-            turn_input_ids = self.tokenizer(msg, add_special_tokens=turn_idx == 0).input_ids
-
-            # [CRITICAL] We do not want to take the loss for the "USER: <msg>" prompts =>> just the responses!
-            turn_labels = (
-                [IGNORE_INDEX for _ in range(len(turn_input_ids))] if (turn_idx % 2) == 0 else list(turn_input_ids)
-            )
-
-            # Add to Trackers
-            input_ids.extend(turn_input_ids)
-            labels.extend(turn_labels)
-
-        # Tensorize =>> Set the <BOS> token's label to IGNORE_INDEX (since we're inserting the image patches after)
-        #   - IMPORTANT => IF WE'RE USING HF LLM.forward(... labels=labels), SHIFTING HAPPENS _INSIDE_ MODEL!
-        input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
-
-        # Handle Truncation (if necessary)
-        input_ids, labels = input_ids[: self.tokenizer.model_max_length], labels[: self.tokenizer.model_max_length]
-
-        # === Handle "unimodal" (language-only) vs. "multimodal" ===
-        if "image" in self.examples[idx]:
-            image_path = Path(self.examples[idx]["image"])
-
-            # Set the <BOS> token's label to IGNORE_INDEX (since we're inserting the image patches right after)
-            labels[0] = IGNORE_INDEX
-
-            # Process Image --> get "pixel_values" (will either be a torch.Tensor OR a Dict[str,torch.Tensor])
-            # Fall back to the next example if this image is corrupt/missing rather than crashing the dataloader.
+        MAX_TRIES = 32
+        n = len(self.examples)
+        for _ in range(MAX_TRIES):
             try:
-                pixel_values = self.image_transform(Image.open(self.image_dir / image_path).convert("RGB"))
-            except _BAD_IMAGE_ERRORS as ex:
-                overwatch.warning(f"[FinetuneDataset] Skipping bad image idx={idx} path={image_path} ({type(ex).__name__}: {ex})")
-                return self.__getitem__((idx + 1) % len(self.examples))
+                example = self.examples[idx]
+                conversation = example["conversations"]
 
-            return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
+                # Decode JSON-string `conversations` if present (some variants store the
+                # turn list as an encoded string instead of a list).
+                if isinstance(conversation, str):
+                    conversation = json.loads(conversation)
 
-        else:
-            # No image --> return `pixel_values` = None; Collator will do the smart batch handling for us!
-            return dict(pixel_values=None, input_ids=input_ids, labels=labels)
+                # Structural validation: each turn must be a dict with string `from`+`value`.
+                if not isinstance(conversation, list) or len(conversation) < 2 or not all(
+                    isinstance(t, dict) and isinstance(t.get("from"), str) and isinstance(t.get("value"), str)
+                    for t in conversation
+                ):
+                    overwatch.warning(f"[FinetuneDataset] Skipping malformed conversation idx={idx}")
+                    idx = (idx + 1) % n
+                    continue
+
+                # Create Prompt Builder --> add each message sequentially.
+                prompt_builder, input_ids, labels = self.prompt_builder_fn(model_family="prismatic"), [], []
+                for turn_idx, turn in enumerate(conversation):
+                    msg = prompt_builder.add_turn(turn["from"], turn["value"])
+                    if isinstance(self.tokenizer, LlamaTokenizerFast):
+                        msg = msg.rstrip()
+                    elif isinstance(self.tokenizer, (CodeGenTokenizerFast, GPT2TokenizerFast)):
+                        # SmolLM2's tokenizer is a GPT2TokenizerFast variant; no auto-BOS, no extra rstrip.
+                        pass
+                    else:
+                        raise ValueError(f"Tokenizer of type `{type(self.tokenizer)}` is not explicitly handled!")
+
+                    turn_input_ids = self.tokenizer(msg, add_special_tokens=turn_idx == 0).input_ids
+                    turn_labels = (
+                        [IGNORE_INDEX for _ in range(len(turn_input_ids))]
+                        if (turn_idx % 2) == 0
+                        else list(turn_input_ids)
+                    )
+                    input_ids.extend(turn_input_ids)
+                    labels.extend(turn_labels)
+
+                # Tensorize =>> shifting happens INSIDE HF LLM.forward() when labels= is passed.
+                input_ids, labels = torch.tensor(input_ids), torch.tensor(labels)
+                input_ids = input_ids[: self.tokenizer.model_max_length]
+                labels = labels[: self.tokenizer.model_max_length]
+
+                if "image" in example:
+                    image_path = Path(example["image"])
+                    labels[0] = IGNORE_INDEX
+
+                    try:
+                        pixel_values = self.image_transform(Image.open(self.image_dir / image_path).convert("RGB"))
+                    except _BAD_IMAGE_ERRORS as ex:
+                        overwatch.warning(
+                            f"[FinetuneDataset] Skipping bad image idx={idx} path={image_path} "
+                            f"({type(ex).__name__}: {ex})"
+                        )
+                        idx = (idx + 1) % n
+                        continue
+
+                    return dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels)
+
+                # Unimodal (language-only) — Collator handles the batch.
+                return dict(pixel_values=None, input_ids=input_ids, labels=labels)
+
+            except (KeyError, TypeError, AttributeError, IndexError) as ex:
+                overwatch.warning(
+                    f"[FinetuneDataset] Skipping idx={idx} due to {type(ex).__name__}: {ex}"
+                )
+                idx = (idx + 1) % n
+                continue
+
+        raise RuntimeError(
+            f"[FinetuneDataset] no usable example after {MAX_TRIES} tries starting at idx={idx}. "
+            "Dataset is likely badly corrupted or paths are wrong."
+        )
 
     def get_modality_lengths(self) -> List[Tuple[bool, int]]:
         """Get a list of modalities (unimodal / text-only vs. multimodal) and length of conversations per example."""
         modality_lengths = []
         for example in self.examples:
             is_multimodal = "image" in example
-            n_words = sum([len(turn["value"].split()) for turn in example["conversations"]])
+            conv = example.get("conversations", [])
+            if isinstance(conv, str):
+                try:
+                    conv = json.loads(conv)
+                except (ValueError, TypeError):
+                    conv = []
+            n_words = 0
+            for turn in conv if isinstance(conv, list) else []:
+                if isinstance(turn, dict) and isinstance(turn.get("value"), str):
+                    n_words += len(turn["value"].split())
             modality_lengths.append((is_multimodal, n_words))
         return modality_lengths
 

@@ -16,6 +16,7 @@ from prismatic.models.backbones.llm.prompting import (
     LLaMa2ChatPromptBuilder,
     PromptBuilder,
     PurePromptBuilder,
+    SmolLM2ChatPromptBuilder,
     VicunaV15ChatPromptBuilder,
 )
 from prismatic.overwatch import initialize_overwatch
@@ -101,17 +102,7 @@ class LLaMa2LLMBackbone(HFCausalLLMBackbone):
             return VicunaV15ChatPromptBuilder
 
         elif self.identifier.startswith("smollm2"):
-            # SmolLM2-Instruct was chat-tuned with an `<|im_start|>` template; PurePromptBuilder's
-            # `In:/Out:` format does NOT match that. The model will still train and produce a loss
-            # curve (fine for wiring/smoke tests), but expect noticeably worse convergence and final
-            # accuracy than a proper chat-template prompter. Replace with a dedicated
-            # SmolLM2ChatPromptBuilder before reporting any numbers.
-            overwatch.warning(
-                f"[smollm2] Using PurePromptBuilder for `{self.identifier}` — this does NOT match "
-                "SmolLM2-Instruct's chat template (`<|im_start|>` style). Expect degraded loss/accuracy "
-                "vs. a proper chat-template prompter. OK for smoke tests; replace before reporting results."
-            )
-            return PurePromptBuilder
+            return SmolLM2ChatPromptBuilder
 
         raise ValueError(f"No PromptBuilder defined for LLM Backbone `{self.identifier}`")
 

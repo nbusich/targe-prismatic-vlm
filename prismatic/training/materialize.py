@@ -43,6 +43,8 @@ def get_train_strategy(
     selector_lambda_target: float = 0.05,
     selector_lambda_warmup_ratio: float = 0.1,
     selector_target_keep_ratio: float = 0.5,
+    num_workers: Optional[int] = None,
+    pin_memory: bool = True,
 ) -> TrainingStrategy:
     if train_strategy in TRAIN_STRATEGIES:
         strategy_cfg = TRAIN_STRATEGIES[train_strategy]
@@ -69,6 +71,8 @@ def get_train_strategy(
             selector_lambda_target=selector_lambda_target,
             selector_lambda_warmup_ratio=selector_lambda_warmup_ratio,
             selector_target_keep_ratio=selector_target_keep_ratio,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
             **strategy_cfg["kwargs"],
         )
         return strategy

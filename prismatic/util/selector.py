@@ -98,14 +98,42 @@ class SelectorCompressorPipeline(nn.Module):
         self.inference_k = 128
         self.latest_keep_probs = None
 
+        # === Ablation routing (eval-time only) ===
+        # route_mode in {"selector", "full", "random_topk", "oracle"}
+        # use_qformer toggles the compress_mha path
+        # _oracle_indices: optional LongTensor (B, k) set by the eval harness per batch
+        # latest_selected_indices: LongTensor (B, k) saved on the "selector" path for IoU
+        self.route_mode = "selector"
+        self.use_qformer = True
+        self._oracle_indices = None
+        self.latest_selected_indices = None
+
     def forward(self, x):
         """
         Automatically routes to the correct logic based on model.train() or model.eval()
         """
         if self.training:
+            print("Training")
             return self._forward_train(x)
         else:
-            return self._forward_inference(x, k=self.inference_k)
+            print("Not Training")
+            return self._forward_inference(
+                x,
+                k=self.inference_k,
+                route_mode=self.route_mode,
+                use_qformer=self.use_qformer,
+                oracle_indices=self._oracle_indices,
+            )
+
+    @staticmethod
+    def _gather_split(x, sorted_idx, k):
+        """Split x along seq dim into (kept = first k rows of sorted_idx, dropped = rest)."""
+        B, N, D = x.shape
+        kept_raw = sorted_idx[:, :k]
+        dropped_raw = sorted_idx[:, k:]
+        kept = torch.gather(x, dim=1, index=kept_raw.unsqueeze(-1).expand(-1, -1, D))
+        dropped = torch.gather(x, dim=1, index=dropped_raw.unsqueeze(-1).expand(-1, -1, D))
+        return kept, dropped, kept_raw
 
     def _forward_train(self, x):
         # 0: Project vit dim to llm dim
@@ -116,17 +144,14 @@ class SelectorCompressorPipeline(nn.Module):
         # 1. Get routing masks (Shape: B, N, 1) and probs
         _, _, keep_mask, compress_mask, keep_probs = self.selector(x, self.tau)
 
-        # 2. BYPASS PATH (Soft Masking)
-        # Keep tensor size (B, N, D), zero out rejected tokens. 
-        # Gradients flow through this multiplication.
+        # 2. BYPASS PATH: mask out rejected tokens
         bypassed_tokens = x * keep_mask 
 
-        # 3. COMPRESSION PATH (Soft Masking)
+        # 3. COMPRESSION: 
         queries = self.compress_queries.expand(B, -1, -1) # (B, M, D)
         tokens_to_compress = x * compress_mask            # (B, N, D)
         
-        # We must tell PyTorch MHA to ignore the zeroed-out tokens.
-        # key_padding_mask expects True for tokens to IGNORE.
+        # Tell MHA to ignore masked tokens
         compress_padding_mask = (compress_mask.squeeze(-1) == 0) # (B, N)
 
         compressed_tokens, _ = self.compress_mha(
@@ -134,13 +159,11 @@ class SelectorCompressorPipeline(nn.Module):
             key=tokens_to_compress, 
             value=tokens_to_compress, 
             key_padding_mask=compress_padding_mask
-        ) # Output Shape: (B, M, D)
+        )
 
-        # 4. RECOMBINE FOR CONNECTOR
-        # Combine the padded sequence and the M compressed tokens
+        # 4. RECOMBINE FOR CONNECTOR: concat the selected, masked, and LQVs
         combined_sequence = torch.cat([bypassed_tokens, compressed_tokens], dim=1) # (B, N + M, D)
 
-        # Create a padding mask for the downstream connector
         # keep_mask is 1 (keep). Compressed tokens are always kept (1).
         compressed_mask_ones = torch.ones(B, self.num_compressed_tokens, device=x.device)
         connector_mask = torch.cat([keep_mask.squeeze(-1), compressed_mask_ones], dim=1) # (B, N + M)
@@ -154,58 +177,277 @@ class SelectorCompressorPipeline(nn.Module):
 
 
     @torch.no_grad()
-    def _forward_inference(self, x, k=128): # Replaced threshold with k
+    def _forward_inference(
+        self,
+        x,
+        k=128,
+        route_mode="selector",
+        use_qformer=True,
+        oracle_indices=None,
+    ):
         """
-        Uses Top-K selection to physically drop tokens.
-        Supports Batched Inference (B >= 1) because K is uniform across the batch!
-        """
-        # 0: Project vit to LLM dim
-        x = self.vit2llm(x)
+        Inference path with ablation routing. Always runs `vit2llm` then `connector`;
+        the middle (which tokens are kept vs. compressed) depends on `route_mode`
+        and `use_qformer`.
 
+        route_mode:
+          - "selector":    Trained Gumbel selector picks top-k.
+          - "full":        Keep all N tokens (no selection).
+          - "random_topk": Randomly pick k tokens.
+          - "oracle":      Use externally provided `oracle_indices` (B, k).
+
+        use_qformer:
+          If True, dropped tokens go through `compress_mha` against learned queries
+          and the M compressed tokens are concatenated to the kept tokens.
+          If False, only kept tokens are forwarded.
+        """
+        x = self.vit2llm(x)
         B, N, D = x.shape
 
-        # Safety catch: If the image is smaller than K, just keep everything
-        actual_k = min(k, N)
-
-        # 1. Get raw probabilities (bypass Gumbel noise)
-        logits = self.selector.router(x)
-        keep_probs = F.softmax(logits, dim=-1)[:, :, 0] # (B, N)
-        
-        # 2. Sort the tokens by their probability of being kept
-        # sorted_indices shape: (B, N)
-        _, sorted_indices = torch.sort(keep_probs, dim=1, descending=True)
-        
-        # 3. Split indices into Keep and Compress buckets
-        keep_idx_raw = sorted_indices[:, :actual_k]      # (B, actual_k)
-        compress_idx_raw = sorted_indices[:, actual_k:]  # (B, N - actual_k)
-
-        # 4. Expand indices to match the embedding dimension D for gathering
-        keep_idx = keep_idx_raw.unsqueeze(-1).expand(-1, -1, D)         # (B, actual_k, D)
-        compress_idx = compress_idx_raw.unsqueeze(-1).expand(-1, -1, D) # (B, N - actual_k, D)
-
-        # 5. PHYSICAL EXTRACTION (Sequence length dynamically shrinks here)
-        bypassed_tokens = torch.gather(x, dim=1, index=keep_idx)        # (B, actual_k, D)
-        tokens_to_compress = torch.gather(x, dim=1, index=compress_idx) # (B, N - actual_k, D)
-
-        # 6. COMPRESSION PATH (Physical)
-        queries = self.compress_queries.expand(B, -1, -1)
-        
-        # Only run cross-attention if there are actually tokens left to compress
-        if tokens_to_compress.size(1) > 0:
-            compressed_tokens, _ = self.compress_mha(
-                query=queries, 
-                key=tokens_to_compress, 
-                value=tokens_to_compress
-            ) # (B, M, D)
-        else:
-            # If all tokens were kept, compressor outputs zeros to maintain shape
-            compressed_tokens = torch.zeros(B, self.num_compressed_tokens, D, device=x.device)
-
-        # 7. RECOMBINE FOR CONNECTOR
-        combined_sequence = torch.cat([bypassed_tokens, compressed_tokens], dim=1) # (B, actual_k + M, D)
-
-        # 8. Execute downstream connector
-        final_output = self.connector(combined_sequence)
         self.latest_keep_probs = None
+        self.latest_selected_indices = None
+
+        # ---- Determine kept / dropped token splits ----
+        if route_mode == "full":
+            kept = x
+            dropped = x.new_zeros(B, 0, D)
+
+        elif route_mode == "random_topk":
+            actual_k = min(k, N)
+            perm = torch.stack(
+                [torch.randperm(N, device=x.device) for _ in range(B)], dim=0
+            )  # (B, N)
+            kept, dropped, _ = self._gather_split(x, perm, actual_k)
+
+        elif route_mode == "oracle":
+            assert oracle_indices is not None, "`oracle` route_mode requires `oracle_indices`"
+            assert oracle_indices.dim() == 2 and oracle_indices.size(0) == B, (
+                f"oracle_indices must be (B, k); got {tuple(oracle_indices.shape)}"
+            )
+            oi = oracle_indices.to(x.device, dtype=torch.long)
+            actual_k = oi.size(1)
+            # Build the complement so we can optionally feed it to the Q-Former.
+            mask = torch.ones(B, N, dtype=torch.bool, device=x.device)
+            mask.scatter_(1, oi, False)
+            complement = torch.stack([mask[b].nonzero(as_tuple=False).squeeze(-1) for b in range(B)], dim=0)
+            sorted_idx = torch.cat([oi, complement], dim=1)
+            kept, dropped, _ = self._gather_split(x, sorted_idx, actual_k)
+
+        elif route_mode == "selector":
+            actual_k = min(k, N)
+
+            # Match training: route on attention-enriched representations
+            # (the router was trained on `x + mha(x)`, not raw `x`). We reuse
+            # `selector.mha` + `selector.router` but skip `selector.forward`'s
+            # Gumbel sampling (stochastic + soft-mask shape) since inference
+            # wants deterministic top-K indices.
+            attn_out, _ = self.selector.mha(query=x, key=x, value=x, need_weights=False)
+            context_x = x + attn_out
+            logits = self.selector.router(context_x)
+            keep_probs = F.softmax(logits, dim=-1)[:, :, 0]
+
+            # Gather kept/dropped tokens from the *un-attended* `x`, matching the
+            # training bypass path (`bypassed_tokens = x * keep_mask` on raw `x`).
+            _, sorted_idx = torch.sort(keep_probs, dim=1, descending=True)
+            kept, dropped, kept_raw = self._gather_split(x, sorted_idx, actual_k)
+            self.latest_selected_indices = kept_raw
+
+        else:
+            raise ValueError(f"Unknown route_mode `{route_mode}`")
+
+        # ---- Optional Q-Former compression of dropped tokens ----
+        if use_qformer:
+            queries = self.compress_queries.expand(B, -1, -1)
+            if dropped.size(1) > 0:
+                compressed, _ = self.compress_mha(
+                    query=queries, key=dropped, value=dropped
+                )
+            else:
+                compressed = torch.zeros(
+                    B, self.num_compressed_tokens, D, device=x.device, dtype=x.dtype
+                )
+            combined = torch.cat([kept, compressed], dim=1)
+        else:
+            combined = kept
+
+        return self.connector(combined)
+
+
+if __name__ == "__main__":
+    # Phi-2 (llm_dim=2560) + CLIP ViT-L/14-336px (vision_dim=1024) setup.
+    # num_heads must divide llm_dim; default 12 doesn't divide 2560, so pick 16.
+    # Param count is independent of num_heads (all MHA projections are full-dim).
+    # MLP projector inlined (mirrors prismatic.util.nn_utils.MLPProjector) so this
+    # script runs without dragging in the rest of the `prismatic` package.
+    def build_mlp_projector(vision_dim: int, llm_dim: int) -> nn.Sequential:
+        return nn.Sequential(
+            nn.Linear(vision_dim, llm_dim, bias=True),
+            nn.GELU(),
+            nn.Linear(llm_dim, llm_dim, bias=True),
+        )
+
+    VISION_DIM = 1024
+    LLM_DIM = 2560
+    NUM_HEADS = 16
+    NUM_COMPRESSED_TOKENS = 32
+
+    def _fmt(n: int) -> str:
+        return f"{n:>14,}  ({n / 1e6:6.2f}M)"
+
+    selector = SelectorCompressorPipeline(
+        vision_dim=VISION_DIM,
+        llm_dim=LLM_DIM,
+        num_heads=NUM_HEADS,
+        num_compressed_tokens=NUM_COMPRESSED_TOKENS,
+    )
+    mlp = build_mlp_projector(vision_dim=VISION_DIM, llm_dim=LLM_DIM)
+
+    print(f"Phi-2 setup: vision_dim={VISION_DIM}, llm_dim={LLM_DIM}, "
+          f"num_heads={NUM_HEADS}, num_compressed_tokens={NUM_COMPRESSED_TOKENS}\n")
+
+    print("=== SelectorCompressorPipeline ===")
+    submodules = [
+        ("vit2llm",          selector.vit2llm),
+        ("selector.mha",     selector.selector.mha),
+        ("selector.router",  selector.selector.router),
+        ("compress_queries", selector.compress_queries),
+        ("compress_mha",     selector.compress_mha),
+        ("connector",        selector.connector),
+    ]
+    sel_total = 0
+    for name, m in submodules:
+        n = m.numel() if isinstance(m, nn.Parameter) else sum(p.numel() for p in m.parameters())
+        sel_total += n
+        print(f"  {name:<18s}{_fmt(n)}")
+    print(f"  {'-' * 18}{'-' * 30}")
+    print(f"  {'TOTAL':<18s}{_fmt(sel_total)}")
+    full_sel = sum(p.numel() for p in selector.parameters())
+    assert full_sel == sel_total, f"per-submodule sum {sel_total:,} != module total {full_sel:,}"
+
+    print("\n=== MLPProjector (gelu-mlp baseline) ===")
+    mlp_total = sum(p.numel() for p in mlp.parameters())
+    print(f"  {'TOTAL':<18s}{_fmt(mlp_total)}")
+
+    print(f"\nDelta (selector − mlp): {_fmt(sel_total - mlp_total)}")
+    print(f"Ratio  selector / mlp : {sel_total / mlp_total:.2f}x")
+    
+
+if __name__ == "__main__":
+    
+    # # TRAINING:
+    # # Fake Input: (Batch Dim (B), Seq_dim (N), V_dim (D))
+    # BATCH_DIM=12
+    # SEQUENCE_DIM=196
+    
+    # NUM_LQV = 32
+    # TOP_K = 68
+    
+    # VISION_DIM=132
+    # LLM_DIM = 256
+    # NUM_HEADS = 8
+
+    # x = torch.rand((BATCH_DIM, SEQUENCE_DIM, VISION_DIM))
+
+    # scp = SelectorCompressorPipeline(vision_dim=VISION_DIM, llm_dim=LLM_DIM, num_heads=NUM_HEADS, num_compressed_tokens=NUM_LQV)
+    
+    # scp.training = True
+    # y, mask = scp.forward(x)
+    # print("Training: Should be original + lqv", y.shape)
+    # assert y.shape == (BATCH_DIM, SEQUENCE_DIM+NUM_LQV, LLM_DIM)
+
+    # scp.training = False
+    # y = scp._forward_inference(x, k=TOP_K)
+    # print(f"Eval: Should be {TOP_K+NUM_LQV}", y.shape)
+    # assert y.shape == (BATCH_DIM, TOP_K+NUM_LQV, LLM_DIM)
+
+    if __name__ == "__main__":
+    # --- Dummy Hyperparameters ---
+        B = 2       # Batch size
+        N = 196     # Number of input vision tokens (e.g., 14x14 ViT patch grid)
+        vision_dim = 768
+        llm_dim = 512
+        num_heads = 8
+        num_compressed_tokens = 16  # 'M' in the comments
+        k = 64                      # Inference kept tokens
+
+        print("=== INITIALIZING PIPELINE ===")
+        model = SelectorCompressorPipeline(
+            vision_dim=vision_dim, 
+            llm_dim=llm_dim, 
+            num_heads=num_heads, 
+            num_compressed_tokens=num_compressed_tokens
+        )
         
-        return final_output
+        # Create dummy input simulating vision encoder output
+        x = torch.randn(B, N, vision_dim)
+        print(f"Input 'x' shape:                {x.shape} -> (Batch, N, vision_dim)")
+
+        print("\n" + "="*40)
+        print("=== INTERMEDIATE COMPONENT SHAPES ===")
+        print("="*40)
+        
+        # 1. Vision to LLM Projection
+        x_proj = model.vit2llm(x)
+        print(f"1. vit2llm(x) shape:            {x_proj.shape} -> (Batch, N, llm_dim)")
+
+        # 2. Selector Output
+        k_set, q_set, keep_mask, compress_mask, keep_probs = model.selector(x_proj)
+        print(f"2. Selector k_set shape:        {k_set.shape} -> (Batch, N, llm_dim)")
+        print(f"   Selector keep_mask shape:    {keep_mask.shape}   -> (Batch, N, 1)")
+        print(f"   Selector keep_probs shape:   {keep_probs.shape}     -> (Batch, N)")
+
+        # 3. Compressor (Learnable Queries)
+        queries = model.compress_queries.expand(B, -1, -1)
+        compress_padding_mask = (compress_mask.squeeze(-1) == 0)
+        compressed_tokens, _ = model.compress_mha(
+            query=queries, 
+            key=q_set, 
+            value=q_set, 
+            key_padding_mask=compress_padding_mask
+        )
+        print(f"3. Compressed tokens shape:     {compressed_tokens.shape} -> (Batch, M, llm_dim)")
+
+
+        print("\n" + "="*40)
+        print("=== FULL PIPELINE TESTING ===")
+        print("="*40)
+
+        print("\n--- TEST 1: TRAIN MODE ---")
+        model.train()
+        out_train, mask_train = model(x)
+        print(f"Forward Output shape:  {out_train.shape} # Expected: (B, N + M, llm_dim) -> ({B}, {N + num_compressed_tokens}, {llm_dim})")
+        print(f"Forward Mask shape:    {mask_train.shape}    # Expected: (B, N + M) -> ({B}, {N + num_compressed_tokens})")
+
+        print("\n--- TEST 2: INFERENCE (SELECTOR + Q-FORMER) ---")
+        model.eval()
+        model.route_mode = "selector"
+        model.use_qformer = True
+        model.inference_k = k
+        out_eval_sel = model(x)
+        print(f"Output shape:          {out_eval_sel.shape} # Expected: (B, k + M, llm_dim) -> ({B}, {k + num_compressed_tokens}, {llm_dim})")
+        print(f"Selected indices:      {model.latest_selected_indices.shape}      # Expected: (B, k)")
+
+        print("\n--- TEST 3: INFERENCE (FULL + NO Q-FORMER) ---")
+        model.route_mode = "full"
+        model.use_qformer = False
+        out_eval_full = model(x)
+        print(f"Output shape:          {out_eval_full.shape} # Expected: (B, N, llm_dim) -> ({B}, {N}, {llm_dim})")
+
+        print("\n--- TEST 4: INFERENCE (RANDOM TOP-K + Q-FORMER) ---")
+        model.route_mode = "random_topk"
+        model.use_qformer = True
+        out_eval_rand = model(x)
+        print(f"Output shape:          {out_eval_rand.shape} # Expected: (B, k + M, llm_dim) -> ({B}, {k + num_compressed_tokens}, {llm_dim})")
+
+        print("\n--- TEST 5: INFERENCE (ORACLE + Q-FORMER) ---")
+        model.route_mode = "oracle"
+        model.use_qformer = True
+        # Simulate an external oracle providing target indices (e.g., ground truth mask)
+        dummy_oracle_indices = torch.stack([torch.randperm(N)[:k] for _ in range(B)], dim=0)
+        model._oracle_indices = dummy_oracle_indices
+        out_eval_oracle = model(x)
+        print(f"Output shape:          {out_eval_oracle.shape} # Expected: (B, k + M, llm_dim) -> ({B}, {k + num_compressed_tokens}, {llm_dim})")
+
+
+
+        
