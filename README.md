@@ -2,7 +2,7 @@
 ## Reducing Visual Token Count in Vision-Language Models via Attention-Based Pruning
 _Vision language models face a computational bottleneck arising from the high dimensionality of visual token sequences relative to the token representations processed by large language models. This paper proposes and evaluates TARGE, a connector that employs attention-based pruning to reduce the visual token sequence to only the most semantically relevant regions of an image, with the aim of reducing the computational cost of multimodal fusion. The connector is evaluated across varying token budgets and compared against established connector mechanisms, including multilayer perceptrons and the Q-Former, using the LAION/CC/SBU BLIP-Caption 558K dataset. Small- scale training results demonstrate that the selector learns to identify semantically important tokens and outperforms the MLP connector on CLIPScore; however, a computational advantage was not observed under the tested conditions._
 
-![Screenshot of a comment on a GitHub issue showing an image, added in the Markdown, of an Octocat smiling and raising a tentacle.](https://myoctocat.com/assets/images/base-octocat.svg)
+![Input image with overlayed selector keep/drop probabilities](https://github.com/nbusich/targe-prismatic-vlm/blob/main/results/selector_heatmap.png)
 
 ## Based on: Prismatic VLMs
 
