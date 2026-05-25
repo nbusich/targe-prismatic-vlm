@@ -1,25 +1,12 @@
-# Prismatic VLMs
+# Token Attention-Based Reduction for Generation Efficiency (TARGE): 
+## Reducing Visual Token Count in Vision-Language Models via Attention-Based Pruning
+_Vision language models face a computational bottleneck arising from the high dimensionality of visual token sequences relative to the token representations processed by large language models. This paper proposes and evaluates TARGE, a connector that employs attention-based pruning to reduce the visual token sequence to only the most semantically relevant regions of an image, with the aim of reducing the computational cost of multimodal fusion. The connector is evaluated across varying token budgets and compared against established connector mechanisms, including multilayer perceptrons and the Q-Former, using the LAION/CC/SBU BLIP-Caption 558K dataset. Small- scale training results demonstrate that the selector learns to identify semantically important tokens and outperforms the MLP connector on CLIPScore; however, a computational advantage was not observed under the tested conditions._
 
-[![arXiv](https://img.shields.io/badge/arXiv-2402.07865-df2a2a.svg?style=for-the-badge)](https://arxiv.org/abs/2402.07865)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.2.1-EE4C2C.svg?style=for-the-badge&logo=pytorch)](https://pytorch.org/get-started/locally/)
-[![Python](https://img.shields.io/badge/python-3.10-blue?style=for-the-badge)](https://www.python.org)
-[![License](https://img.shields.io/github/license/TRI-ML/prismatic-vlms?style=for-the-badge)](LICENSE)
+![Screenshot of a comment on a GitHub issue showing an image, added in the Markdown, of an Octocat smiling and raising a tentacle.](https://myoctocat.com/assets/images/base-octocat.svg)
 
-[**Installation**](#installation) | [**Usage**](#usage) | [**Pretrained Models**](#pretrained-models) | [**Training VLMs**](#training-vlms)
+## Based on: Prismatic VLMs
 
-A flexible and efficient codebase for training visually-conditioned language-models (VLMs):
-
-- **Different Visual Representations**. We natively support backbones such as [CLIP](https://arxiv.org/abs/2103.00020), 
-  [SigLIP](https://arxiv.org/abs/2303.15343), [DINOv2](https://arxiv.org/abs/2304.07193) – and even fusions of different backbones. 
-  Adding new backbones is easy via [TIMM](https://huggingface.co/timm).
-- **Base and Instruct-Tuned Language Models**. We support arbitrary instances of `AutoModelForCausalLM` including both 
-  base and instruct-tuned models (with built-in prompt handling) via [Transformers](https://github.com/huggingface/transformers). 
-  If your favorite LM isn't already supported, feel free to submit a PR!
-- **Easy Scaling**. Powered by PyTorch FSDP and Flash-Attention, we can quickly and efficiently train models from 1B - 
-  34B parameters, on different, easily configurable dataset mixtures.
-
-If you're interested in rigorously evaluating existing VLMs, check our [evaluation codebase](https://github.com/TRI-ML/vlm-evaluation)
-that bundles together 12 different battle-tested vision-and-language benchmarks through a clean, automated test harness. 
+A flexible and efficient codebase for training visually-conditioned language-models (VLMs): 
 
 ---
 
@@ -190,29 +177,3 @@ the full list of model types are available in our [config file](prismatic/conf/m
 each dataclass.
 
 ---
-
-## Repository Structure
-
-High-level overview of repository/project file-tree:
-
-+ `prismatic` - Package source; provides core utilities for model loading, training, data preprocessing, etc.
-+ `scripts/` - Standalone scripts for preprocessing, training VLMs, and generating from pretrained models.
-+ `LICENSE` - All code is made available under the MIT License; happy hacking!
-+ `Makefile` - Top-level Makefile (by default, supports linting - checking & auto-fix); extend as needed.
-+ `pyproject.toml` - Full project configuration details (including dependencies), as well as tool configurations.
-+ `README.md` - You are here!
-
----
-
-#### Citation 
-
-If you find our code or models useful in your work, please cite [our paper](https://arxiv.org/abs/2402.07865):
-
-```bibtex
-@inproceedings{karamcheti2024prismatic,
-  title = {Prismatic VLMs: Investigating the Design Space of Visually-Conditioned Language Models},
-  author = {Siddharth Karamcheti and Suraj Nair and Ashwin Balakrishna and Percy Liang and Thomas Kollar and Dorsa Sadigh},
-  booktitle = {International Conference on Machine Learning (ICML)},
-  year = {2024},
-}
-```
